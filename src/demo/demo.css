@@ -1,0 +1,58 @@
+/* Demo page layout only: form column + sticky inspector column, stacking below 900px. */
+:root {
+  --demo-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --demo-code-bg: #eef1f4;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --demo-code-bg: #0e1318; }
+}
+:root[data-theme="dark"] { --demo-code-bg: #0e1318; }
+
+html, body { background: var(--sf-bg); color: var(--sf-fg); }
+body { margin: 0; font-family: var(--sf-font); }
+
+.demo {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-block: 32px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+.demo-head { display: flex; flex-direction: column; gap: 8px; max-width: 68ch; }
+.demo-head h1 { margin: 0; font-size: 30px; font-weight: 700; letter-spacing: -0.01em; text-wrap: balance; }
+.demo-eyebrow {
+  margin: 0; font-family: var(--demo-mono); font-size: 12px;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--sf-accent);
+}
+.demo-lede { margin: 0; color: var(--sf-muted); }
+
+.demo-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 420px); gap: 28px; align-items: start; }
+.demo-form { min-width: 0; }
+.demo-side {
+  position: sticky; top: 16px;
+  display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  border: 1px solid var(--sf-line); border-radius: var(--sf-radius);
+  background: var(--sf-surface); padding: 14px;
+}
+.demo-tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+.demo-tabs button {
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  border: 1px solid transparent; background: none; color: var(--sf-muted);
+  border-radius: var(--sf-radius); padding: 5px 10px;
+}
+.demo-tabs button.is-active { background: var(--sf-accent-soft); color: var(--sf-accent); }
+.demo-tabs button:focus-visible { outline: 2px solid var(--sf-accent); outline-offset: 1px; }
+.demo-note { margin: 0; font-size: 13px; color: var(--sf-muted); }
+.demo-pre {
+  margin: 0; font-family: var(--demo-mono); font-size: 12px; line-height: 1.5;
+  background: var(--demo-code-bg); color: var(--sf-fg); border-radius: var(--sf-radius);
+  padding: 12px; overflow: auto; max-height: 70vh; white-space: pre;
+}
+
+@media (max-width: 900px) {
+  .demo-grid { grid-template-columns: minmax(0, 1fr); }
+  .demo-side { position: static; }
+}

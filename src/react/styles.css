@@ -1,0 +1,155 @@
+/* Default look for the built-in controls. Replace or override freely;
+   every color comes from the --sf-* tokens so you can map them to your design system. */
+:root {
+  --sf-bg: #f6f7f9;
+  --sf-surface: #ffffff;
+  --sf-fg: #18212b;
+  --sf-muted: #5b6672;
+  --sf-line: #d5dbe2;
+  --sf-accent: #1b6872;
+  --sf-accent-fg: #ffffff;
+  --sf-accent-soft: #e2f0f1;
+  --sf-error: #b3261e;
+  --sf-radius: 6px;
+  --sf-font: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --sf-bg: #12171d;
+    --sf-surface: #1a2129;
+    --sf-fg: #e5eaef;
+    --sf-muted: #98a3ae;
+    --sf-line: #313b46;
+    --sf-accent: #5fb7c1;
+    --sf-accent-fg: #0b1a1d;
+    --sf-accent-soft: #1d3236;
+    --sf-error: #f2877e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --sf-bg: #12171d;
+  --sf-surface: #1a2129;
+  --sf-fg: #e5eaef;
+  --sf-muted: #98a3ae;
+  --sf-line: #313b46;
+  --sf-accent: #5fb7c1;
+  --sf-accent-fg: #0b1a1d;
+  --sf-accent-soft: #1d3236;
+  --sf-error: #f2877e;
+  color-scheme: dark;
+}
+
+.sf-form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  font-family: var(--sf-font);
+  color: var(--sf-fg);
+  font-size: 15px;
+  line-height: 1.45;
+}
+.sf-col { display: flex; flex-direction: column; gap: 16px; }
+.sf-row { display: flex; flex-wrap: wrap; gap: 16px; }
+.sf-row > * { flex: 1 1 180px; min-width: 0; }
+.sf-row:empty { display: none; }
+
+.sf-object, .sf-group, .sf-array {
+  margin: 0;
+  border: 1px solid var(--sf-line);
+  border-radius: var(--sf-radius);
+  padding: 16px 18px 18px;
+  background: var(--sf-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.sf-object .sf-object, .sf-group .sf-object, .sf-array .sf-object {
+  border-style: dashed;
+  background: transparent;
+}
+.sf-object > legend, .sf-group > legend, .sf-array > legend {
+  font-weight: 650;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sf-muted);
+  padding: 0 6px;
+}
+
+.sf-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; border: 0; margin: 0; padding: 0; }
+.sf-field > label, .sf-radios > legend { font-weight: 550; font-size: 14px; padding: 0; }
+.sf-required { color: var(--sf-error); }
+.sf-help { margin: 0; font-size: 13px; color: var(--sf-muted); }
+
+.sf-field input:not([type="checkbox"]):not([type="radio"]),
+.sf-field select,
+.sf-field textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--sf-surface);
+  border: 1px solid var(--sf-line);
+  border-radius: var(--sf-radius);
+  padding: 8px 10px;
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
+}
+.sf-field textarea { resize: vertical; }
+.sf-field input:disabled, .sf-field select:disabled, .sf-field textarea:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.sf-form :focus-visible { outline: 2px solid var(--sf-accent); outline-offset: 2px; }
+.sf-field--invalid input:not([type="checkbox"]):not([type="radio"]),
+.sf-field--invalid select,
+.sf-field--invalid textarea { border-color: var(--sf-error); }
+
+.sf-inline-label { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; }
+.sf-inline-label input { width: 16px; height: 16px; margin: 0; accent-color: var(--sf-accent); }
+.sf-field--inline { justify-content: flex-end; }
+.sf-radios { display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px 20px; }
+.sf-radios > legend { margin-bottom: 8px; width: 100%; float: left; }
+.sf-radios > .sf-error { width: 100%; }
+
+.sf-select-row { display: flex; gap: 8px; align-items: center; }
+
+.sf-branches { display: flex; flex-wrap: wrap; border: 1px solid var(--sf-line); border-radius: var(--sf-radius); width: fit-content; max-width: 100%; overflow: hidden; }
+.sf-branch { display: flex; align-items: center; padding: 6px 14px; cursor: pointer; font-weight: 550; font-size: 14px; }
+.sf-branch + .sf-branch { border-left: 1px solid var(--sf-line); }
+.sf-branch input { position: absolute; opacity: 0; pointer-events: none; }
+.sf-branch--active { background: var(--sf-accent-soft); color: var(--sf-accent); }
+.sf-branch:has(input:focus-visible) { outline: 2px solid var(--sf-accent); outline-offset: -2px; }
+
+.sf-array-item { display: flex; flex-direction: column; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid var(--sf-line); }
+.sf-array-item-head { display: flex; justify-content: space-between; align-items: baseline; font-weight: 600; font-size: 14px; }
+
+.sf-error { margin: 0; color: var(--sf-error); font-size: 13px; }
+.sf-status { margin: 0; color: var(--sf-muted); font-size: 14px; }
+.sf-summary { font-size: 14px; }
+
+.sf-footer { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.sf-button {
+  font: inherit;
+  font-weight: 600;
+  border: 1px solid var(--sf-accent);
+  background: var(--sf-accent);
+  color: var(--sf-accent-fg);
+  border-radius: var(--sf-radius);
+  padding: 9px 18px;
+  cursor: pointer;
+}
+.sf-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.sf-button--secondary { background: transparent; color: var(--sf-accent); align-self: flex-start; padding: 6px 12px; }
+.sf-link {
+  font: inherit;
+  font-size: 13px;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--sf-accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.sf-link:disabled { color: var(--sf-muted); cursor: not-allowed; }
