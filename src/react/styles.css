@@ -114,6 +114,7 @@
 .sf-radios > .sf-error { width: 100%; }
 
 .sf-select-row { display: flex; gap: 8px; align-items: center; }
+.sf-lookup { margin-top: 6px; }
 
 .sf-branches { display: flex; flex-wrap: wrap; border: 1px solid var(--sf-line); border-radius: var(--sf-radius); width: fit-content; max-width: 100%; overflow: hidden; }
 .sf-branch { display: flex; align-items: center; padding: 6px 14px; cursor: pointer; font-weight: 550; font-size: 14px; }

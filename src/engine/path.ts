@@ -68,3 +68,26 @@ export function isWithin(path: string, ancestor: string): boolean {
   if (path === ancestor) return true;
   return path.startsWith(ancestor + ".") || path.startsWith(ancestor + "[");
 }
+
+/** Immutably set the value at `path`, creating objects/arrays on the way; `undefined` deletes. */
+export function setIn(obj: unknown, path: string | readonly Segment[], value: unknown): unknown {
+  const segs = typeof path === "string" ? parsePath(path) : path;
+  if (!segs.length) return value;
+  const [head, ...rest] = segs as [Segment, ...Segment[]];
+  const container: any =
+    obj && typeof obj === "object" ? (Array.isArray(obj) ? [...obj] : { ...obj }) : typeof head === "number" ? [] : {};
+  const next = rest.length ? setIn(container[head], rest, value) : value;
+  if (next === undefined && !Array.isArray(container)) delete container[head];
+  else container[head] = next;
+  return container;
+}
+
+/** Structural equality for JSON-like values. */
+export function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a).filter((k) => (a as any)[k] !== undefined);
+  const kb = Object.keys(b).filter((k) => (b as any)[k] !== undefined);
+  return ka.length === kb.length && ka.every((k) => deepEqual((a as any)[k], (b as any)[k]));
+}

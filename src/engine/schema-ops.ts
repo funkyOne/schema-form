@@ -45,7 +45,7 @@ export function normalize(s: unknown): Schema {
 
 // ---------------------------------------------------------------- $ref
 
-export function resolvePointer(root: Schema, ref: string): Schema {
+function resolvePointer(root: Schema, ref: string): Schema {
   if (!ref.startsWith("#")) {
     throw new Error(`Only local $refs are supported (got "${ref}")`);
   }
@@ -140,13 +140,6 @@ export function merge(a: Schema, b: Schema): Schema {
     }
     return out;
   });
-}
-
-/** Cached derived value per schema object (for building small helper schemas once). */
-export function derived<T extends object>(cache: WeakMap<object, T>, key: object, make: () => T): T {
-  let v = cache.get(key);
-  if (!v) cache.set(key, (v = make()));
-  return v;
 }
 
 export function primaryType(s: Schema): string | undefined {

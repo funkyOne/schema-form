@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { FormEngine, findUnsupported, toStandardSchema } from "../src/engine";
-import { createLoaders, schema, uischema } from "../src/demo/schema";
+import { createLoaders, schema } from "../src/demo/schema";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
-const make = () => new FormEngine({ schema, uischema, loaders: createLoaders(0) });
+const make = () => new FormEngine({ schema, loaders: createLoaders(0) });
 
 /** Load every async source the current values depend on. */
 async function settle(engine: FormEngine, values: unknown) {
@@ -50,7 +50,7 @@ describe("resolution", () => {
 
     const v = { applicant: { kind: "company" } };
     const co = e.resolve(e.schemaAt("applicant", v), "applicant", v);
-    expect(Object.keys(co.schema.properties)).toEqual(["kind", "companyName", "vatRegistered", "vatNumber"]);
+    expect(Object.keys(co.schema.properties)).toEqual(["kind", "companyNumber", "companyName", "vatRegistered", "vatNumber"]);
     expect(co.schema.title).toBe("Applicant"); // branch title doesn't leak
     const kind = e.resolve(co.schema.properties.kind, "applicant.kind", v).schema;
     expect(kind.enum).toEqual(["individual", "company"]);
@@ -119,7 +119,10 @@ describe("async sources", () => {
     const e = make();
     const v = { product: "car", details: { make: "vw" } };
     await settle(e, v);
-    const entry = e.readOptions(e.schemaAt("details.model", v) as any, "details.model", v);
+    const model = () => e.readOptions(e.resolve(e.schemaAt("details.model", v), "details.model", v).schema, "details.model", v);
+    model();
+    await flush();
+    const entry = model();
     expect(entry?.status === "success" && entry.data.map((o) => o.value)).toEqual(["Golf", "Polo", "ID.3"]);
   });
 
@@ -178,7 +181,7 @@ describe("validation", () => {
     expect(e.validate(values).fields["address.city"]).toBe("Please choose one of the options");
   });
 
-  it("ignores required fields hidden by a UI rule", async () => {
+  it("ignores required fields hidden by x-hidden", async () => {
     const e = make();
     await settle(e, validIndividual);
     expect(e.validate({ ...validIndividual, marketingConsent: false }).fields.marketingChannel).toBeUndefined();
@@ -195,24 +198,22 @@ describe("validation", () => {
   });
 });
 
-describe("rules", () => {
-  it("evaluates SHOW / DISABLE with JSON Logic and JSON Schema conditions", () => {
+describe("hidden and disabled", () => {
+  it("evaluates x-hidden / x-disabled with JSON Logic and JSON Schema conditions", () => {
     const e = make();
-    const show = { effect: "SHOW", condition: { logic: { var: "marketingConsent" } } } as const;
-    expect(e.ruleState(show, "", { marketingConsent: false }).hidden).toBe(true);
-    expect(e.ruleState(show, "", { marketingConsent: true }).hidden).toBe(false);
+    expect(e.schemaAt("marketingChannel", { marketingConsent: false })).toBeUndefined();
+    expect(e.schemaAt("marketingChannel", { marketingConsent: true })).toBeDefined();
 
-    const dis = { effect: "DISABLE", condition: { path: "vatRegistered", schema: { not: { const: true } } } } as const;
-    expect(e.ruleState(dis, "applicant", { applicant: { vatRegistered: false } }).disabled).toBe(true);
-    expect(e.ruleState(dis, "applicant", { applicant: { vatRegistered: true } }).disabled).toBe(false);
+    const company = (vatRegistered: boolean) => ({ applicant: { kind: "company", vatRegistered } });
+    expect(e.disabledAt("applicant.vatNumber", company(false))).toBe(true);
+    expect(e.disabledAt("applicant.vatNumber", company(true))).toBe(false);
   });
 
-  it("resolves $item inside array details", () => {
+  it("evaluates $parent per array item", () => {
     const e = make();
     const v = { hasPreviousClaims: true, claims: [{ type: "fire" }, { type: "other" }] };
-    const hidden = e.collectHidden(v);
-    expect(hidden.has("claims[0].description")).toBe(true);
-    expect(hidden.has("claims[1].description")).toBe(false);
+    expect(e.schemaAt("claims[0].description", v)).toBeUndefined();
+    expect(e.schemaAt("claims[1].description", v)).toBeDefined();
   });
 });
 

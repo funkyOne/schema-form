@@ -9,7 +9,9 @@ import type { Loaders, Option, Schema, UIElement } from "../engine";
  *  - $ref + definitions              (address, claim)
  *  - x-options: dependent API lists  (country -> city, make -> model)
  *  - x-extend: schema fetched from the API when a field changes (product -> details)
- *  - UI rules: SHOW / HIDE / DISABLE (marketing channel, claim description, promo code, VAT number)
+ *  - x-hidden / x-disabled          (marketing channel, claim description, promo code, VAT number)
+ *  - x-prefill: company number -> fills company name, VAT details and address line
+ *  - x-compute: total of the claims, derived with JSON Logic
  */
 export const schema: Schema = {
   $schema: "http://json-schema.org/draft-07/schema#",
@@ -46,7 +48,12 @@ export const schema: Schema = {
         year: { type: "integer", title: "Year", minimum: 2000, maximum: 2026 },
         type: { type: "string", title: "Type", enum: ["accident", "theft", "fire", "other"] },
         amount: { type: "number", title: "Amount (£)", minimum: 0 },
-        description: { type: "string", title: "What happened?" },
+        description: {
+          type: "string",
+          title: "What happened?",
+          // $parent is the claim this field belongs to.
+          "x-hidden": { logic: { "!=": [{ var: "$parent.type" }, "other"] } },
+        },
       },
       required: ["year", "type", "amount"],
       if: { properties: { type: { const: "other" } }, required: ["type"] },
@@ -73,9 +80,26 @@ export const schema: Schema = {
           title: "A company",
           properties: {
             kind: { const: "company" },
+            companyNumber: {
+              type: "string",
+              title: "Company number",
+              description: "Try 12345678",
+              "x-prefill": {
+                source: "company",
+                params: { number: { var: "$self" } },
+                label: "Find company",
+                fill: { companyName: "name", vatRegistered: "vat.registered", vatNumber: "vat.number", "/address.line1": "address" },
+              },
+            },
             companyName: { type: "string", title: "Company name", minLength: 1 },
             vatRegistered: { type: "boolean", title: "VAT registered", default: false },
-            vatNumber: { type: "string", title: "VAT number", pattern: "^GB\\d{9}$" },
+            vatNumber: {
+              type: "string",
+              title: "VAT number",
+              pattern: "^GB\\d{9}$",
+              // `path` is relative to the object holding the field (the applicant).
+              "x-disabled": { path: "vatRegistered", schema: { not: { const: true } } },
+            },
           },
           required: ["companyName"],
           if: { properties: { vatRegistered: { const: true } }, required: ["vatRegistered"] },
@@ -123,14 +147,29 @@ export const schema: Schema = {
     },
     hasPreviousClaims: { type: "boolean", title: "Any claims in the last 5 years?", default: false },
     marketingConsent: { type: "boolean", title: "Send me offers", default: false },
-    marketingChannel: { type: "string", title: "How should we contact you?", enum: ["email", "sms", "post"] },
-    promoCode: { type: "string", title: "Promo code" },
+    marketingChannel: {
+      type: "string",
+      title: "How should we contact you?",
+      enum: ["email", "sms", "post"],
+      // Hidden fields aren't part of the schema, so "required" below only applies when shown.
+      "x-hidden": { logic: { "!=": [{ var: "marketingConsent" }, true] } },
+    },
+    promoCode: { type: "string", title: "Promo code", "x-disabled": { logic: { var: "hasPreviousClaims" } } },
   },
   required: ["applicant", "address", "product", "contact", "marketingChannel"],
   if: { properties: { hasPreviousClaims: { const: true } }, required: ["hasPreviousClaims"] },
   then: {
     properties: {
       claims: { type: "array", title: "Claims", minItems: 1, items: { $ref: "#/definitions/claim" } },
+      // Derived from the claims above; readOnly means it is always recomputed, never edited.
+      claimsTotal: {
+        type: "number",
+        title: "Total claimed (£)",
+        readOnly: true,
+        "x-compute": {
+          logic: { reduce: [{ var: "claims" }, { "+": [{ var: "accumulator" }, { or: [{ var: "current.amount" }, 0] }] }, 0] },
+        },
+      },
     },
     required: ["claims"],
   },
@@ -151,12 +190,11 @@ export const uischema: UIElement = {
             // Fields that aren't in the active branch simply don't render.
             row(ctl("firstName"), ctl("lastName")),
             ctl("dateOfBirth"),
+            ctl("companyNumber"),
             ctl("companyName"),
             row(
               ctl("vatRegistered"),
-              ctl("vatNumber", {
-                rule: { effect: "DISABLE", condition: { path: "vatRegistered", schema: { not: { const: true } } } },
-              }),
+              ctl("vatNumber"),
             ),
           ],
         },
@@ -187,15 +225,12 @@ export const uischema: UIElement = {
               type: "VerticalLayout",
               elements: [
                 row(ctl("year"), ctl("type"), ctl("amount")),
-                ctl("description", {
-                  options: { multi: true },
-                  // $item is the current array item.
-                  rule: { effect: "SHOW", condition: { logic: { "==": [{ var: "$item.type" }, "other"] } } },
-                }),
+                ctl("description", { options: { multi: true } }),
               ],
             },
           },
         }),
+        ctl("claimsTotal"),
       ],
     },
     {
@@ -203,13 +238,8 @@ export const uischema: UIElement = {
       label: "Marketing",
       elements: [
         ctl("marketingConsent"),
-        ctl("marketingChannel", {
-          // Hidden fields are removed before validation and submit, so "required" only applies when shown.
-          rule: { effect: "SHOW", condition: { logic: { "==": [{ var: "marketingConsent" }, true] } } },
-        }),
-        ctl("promoCode", {
-          rule: { effect: "DISABLE", condition: { logic: { var: "hasPreviousClaims" } } },
-        }),
+        ctl("marketingChannel"),
+        ctl("promoCode"),
       ],
     },
   ],
@@ -265,6 +295,10 @@ const PRODUCT_FIELDS: Record<string, Schema> = {
   },
 };
 
+const COMPANIES: Record<string, object> = {
+  "12345678": { name: "Acme Widgets Ltd", vat: { registered: true, number: "GB123456789" }, address: "1 Factory Lane" },
+};
+
 const wait = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     if (ms <= 0) return resolve();
@@ -292,5 +326,10 @@ export function createLoaders(delayMs = 400, log?: (msg: string) => void): Loade
     models: (p, { signal }) =>
       call("models", p, signal, (MODELS[p.make as string] ?? []).map((m) => ({ value: m, label: m }))),
     productFields: (p, { signal }) => call("product-fields", p, signal, PRODUCT_FIELDS[p.product as string] ?? {}),
+    company: async (p, { signal }) => {
+      const found = await call("company", p, signal, COMPANIES[p.number as string]);
+      if (!found) throw new Error("Company not found");
+      return found;
+    },
   };
 }

@@ -1,25 +1,67 @@
 {
-  "name": "schema-form",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "@oleg-nd/schema-form",
+  "version": "0.1.0",
+  "description": "Schema-driven forms for React: JSON Schema + JSON Logic in, TanStack Form and Query underneath, a framework-free engine that also runs on the server.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oleg-nd/schema-form.git"
+  },
+  "homepage": "https://github.com/oleg-nd/schema-form#readme",
+  "bugs": {
+    "url": "https://github.com/oleg-nd/schema-form/issues"
+  },
+  "keywords": [
+    "json-schema",
+    "form",
+    "react",
+    "tanstack-form",
+    "json-logic",
+    "schema-driven",
+    "dynamic-forms"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "*.css"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    },
+    "./engine": {
+      "types": "./dist/engine/index.d.ts",
+      "import": "./dist/engine/index.js"
+    },
+    "./styles.css": "./dist/react/styles.css"
+  },
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "npm run build:lib",
+    "build:lib": "vite build -c vite.lib.config.ts && tsc -p tsconfig.build.json && cp src/react/styles.css dist/react/styles.css",
+    "build:demo": "vite build --outDir dist-demo",
     "test": "vitest run",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "check": "npm run typecheck && npm test && npm run build:lib",
+    "prepublishOnly": "npm run check"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
+    "@tanstack/query-core": "^5.104.5",
     "@tanstack/react-form": "^1.33.5",
+    "@tanstack/store": "^0.11.2",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "json-logic-js": "^2.0.5",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
     "use-sync-external-store": "^1.7.0"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",
@@ -31,9 +73,10 @@
     "@types/use-sync-external-store": "^1.7.0",
     "@vitejs/plugin-react": "^6.1.2",
     "jsdom": "^29.1.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
     "vitest": "^5.0.5"
-  },
-  "type": "module"
+  }
 }

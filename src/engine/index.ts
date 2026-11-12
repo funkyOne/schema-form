@@ -1,12 +1,15 @@
-export { FormEngine, prune, findUnsupported, type EngineOptions, type RuleState } from "./engine";
+export { FormEngine, prune, findUnsupported, type EngineOptions } from "./engine";
 export * from "./types";
 export * from "./path";
+export { primaryType } from "./schema-ops";
+export { noProvenance, pruneProvenance, withPatches, withSource, withoutIndex, withoutPath } from "./provenance";
+export { QUERY_KEY, createQueryClient, isIncomplete } from "./async";
 
 import type { FormEngine } from "./engine";
 import { parsePath } from "./path";
 
 /**
- * Expose the engine as a Standard Schema validator, so the same schema + UI rules
+ * Expose the engine as a Standard Schema validator, so the same schema (including x-hidden / x-disabled)
  * can validate on the server (or be handed to any Standard Schema consumer).
  * Note: async-backed fields (x-options / x-extend) must be loaded first.
  */

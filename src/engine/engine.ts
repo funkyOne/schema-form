@@ -1,72 +1,72 @@
 import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
 import addFormats from "ajv-formats";
+import type { QueryClient } from "@tanstack/query-core";
 import jsonLogic from "json-logic-js";
-import { AsyncCache, Notifier } from "./async";
-import { getIn, joinPath, parsePath, parsePointer, formatPath, resolveRelativePath } from "./path";
-import { deref, derived, idOf, Memo, merge, normalize, primaryType, without } from "./schema-ops";
-import type {
-  AsyncEntry,
-  AsyncSourceRef,
-  Combinator,
-  Condition,
-  Loaders,
-  Option,
-  Resolved,
-  Rule,
-  Schema,
-  UIElement,
-  ValidationResult,
+import { AsyncCache, createQueryClient, isIncomplete, Notifier, watchQueries } from "./async";
+import { deepEqual, getIn, isWithin, joinPath, parsePath, parsePointer, formatPath, resolveRelativePath, setIn } from "./path";
+import { withPatches } from "./provenance";
+import { deref, idOf, Memo, merge, normalize, primaryType, without } from "./schema-ops";
+import {
+  COMPUTE_SOURCE,
+  USER_SOURCE,
+  type AsyncEntry,
+  type AsyncSourceRef,
+  type Combinator,
+  type Compute,
+  type Condition,
+  type Loaders,
+  type Prefill,
+  type Option,
+  type Patch,
+  type Provenance,
+  type Resolved,
+  type Schema,
+  type ValidationResult,
 } from "./types";
 
 export interface EngineOptions {
   schema: Schema;
-  uischema?: UIElement;
   loaders?: Loaders;
+  /** Cache for loader results. Pass your app's client to share results between forms. */
+  queryClient?: QueryClient;
   /** Custom error text. Return undefined to fall back to the defaults. */
   messages?: (error: ErrorObject) => string | undefined;
   /** Throw on schema features the renderer can't handle (default true). */
   strict?: boolean;
 }
 
-export interface RuleState {
-  hidden: boolean;
-  disabled: boolean;
-}
-const RULE_STATES: Record<string, RuleState> = {
-  "00": Object.freeze({ hidden: false, disabled: false }),
-  "01": Object.freeze({ hidden: false, disabled: true }),
-  "10": Object.freeze({ hidden: true, disabled: false }),
-  "11": Object.freeze({ hidden: true, disabled: true }),
-};
+const STRIP_FOR_VALIDATION = ["properties", "items", "required", "x-options", "x-enumLabels", "x-extend", "x-compute", "x-hidden", "x-disabled", "x-prefill", "$schema"];
 
-const STRIP_FOR_VALIDATION = ["properties", "items", "required", "x-options", "x-enumLabels", "x-extend", "$schema"];
+/** Passes `applyComputed` makes before concluding the computes chase each other. */
+const MAX_COMPUTE_PASSES = 10;
+const SKIP = Symbol("skip");
 
 type Flat = { schema: Schema; combinator?: Combinator; nullable: boolean; extend?: AsyncEntry };
 
 export class FormEngine {
   readonly root: Schema;
-  readonly uischema?: UIElement;
+  readonly queryClient: QueryClient;
   /** Bumps when async data arrives or a oneOf branch is picked; React subscribes to it. */
-  readonly notifier = new Notifier();
-  readonly cache: AsyncCache;
+  readonly notifier: Notifier;
+  private cache: AsyncCache;
   /** User-picked branch for oneOf/anyOf without a discriminator, by field path. */
   private selections = new Map<string, number>();
 
   private ajv: Ajv;
-  private testers = new WeakMap<object, ValidateFunction>();
   private validators = new WeakMap<object, ValidateFunction>();
   private resolvedMemo = new Memo<Resolved>();
+  /** Helper schemas built once per combinator array (keyed by its identity). */
+  private derivedMemo = new Memo<any>();
+  /** Concrete schemas interned by content, so equal structures share one compiled validator. */
   private concreteMemo = new Memo<Schema>();
-  private derivedEnum = new WeakMap<object, Schema>();
-  private derivedDisc = new WeakMap<object, Schema>();
-  private derivedBranches = new WeakMap<object, Schema[]>();
   private messages?: EngineOptions["messages"];
 
   constructor(opts: EngineOptions) {
     this.root = opts.schema;
-    this.uischema = opts.uischema;
     this.messages = opts.messages;
-    this.cache = new AsyncCache(opts.loaders ?? {}, this.notifier);
+    this.queryClient = opts.queryClient ?? createQueryClient();
+    this.notifier = new Notifier((notify) => watchQueries(this.queryClient, notify));
+    this.cache = new AsyncCache(opts.loaders ?? {}, this.queryClient);
     this.ajv = new Ajv({ allErrors: true, strict: false, verbose: true });
     addFormats(this.ajv);
     if (opts.strict !== false) {
@@ -77,15 +77,19 @@ export class FormEngine {
 
   // ============================================================== helpers
 
-  /** Does `value` satisfy `schema`? Compiled once per schema object. */
-  test(schema: unknown, value: unknown): boolean {
-    const s = normalize(schema);
-    let fn = this.testers.get(s);
+  /** Compile once per schema object, with the root's definitions available to $refs. */
+  private compile(schema: Schema): ValidateFunction {
+    let fn = this.validators.get(schema);
     if (!fn) {
-      fn = this.ajv.compile({ ...without(s, "$schema"), definitions: this.root.definitions, $defs: this.root.$defs });
-      this.testers.set(s, fn);
+      fn = this.ajv.compile({ ...without(schema, "$schema"), definitions: this.root.definitions, $defs: this.root.$defs });
+      this.validators.set(schema, fn);
     }
-    return fn(value) as boolean;
+    return fn;
+  }
+
+  /** Does `value` satisfy `schema`? */
+  test(schema: unknown, value: unknown): boolean {
+    return this.compile(normalize(schema))(value) as boolean;
   }
 
   /**
@@ -104,11 +108,152 @@ export class FormEngine {
     return values && typeof values === "object" ? { ...(values as object), ...extra } : extra;
   }
 
-  readAsync(ref: AsyncSourceRef, values: unknown, path: string): AsyncEntry {
+  /** Load `ref` for the field at `path`; `missing` stands in for a `select`ed part that isn't there. */
+  readAsync(ref: AsyncSourceRef, values: unknown, path: string, missing?: unknown): AsyncEntry {
+    const entry = this.cache.read(ref.source, this.params(ref, values, path));
+    if (!ref.select || entry.status !== "success") return entry;
+    // Same object while the response is unchanged, so fields reading a slice don't re-render.
+    const select = ref.select;
+    return this.derivedMemo.get(`select:${idOf(entry)}:${select}:${missing === undefined}`, () => ({
+      status: "success",
+      data: getIn(entry.data, select) ?? missing,
+    }));
+  }
+
+  /** Evaluate a ref's JSON Logic params for the field at `path`. */
+  params(ref: AsyncSourceRef, values: unknown, path: string): Record<string, unknown> {
     const scope = this.scope(values, path);
     const params: Record<string, unknown> = {};
     for (const [k, expr] of Object.entries(ref.params ?? {})) params[k] = jsonLogic.apply(expr as any, scope);
-    return this.cache.read(ref.source, params);
+    return params;
+  }
+
+  /**
+   * Run the `x-prefill` of the field at `path` and return the writes to make.
+   * Targets the response has a value for are filled and attributed to the prefill's source.
+   * Targets it lacks are cleared only if this source filled them before (per `provenance`),
+   * so values the user typed are never cleared; with `overwrite: "unedited"` they aren't
+   * overwritten either. Returns [] while a param is still empty.
+   */
+  async prefill(prefill: Prefill, values: unknown, path: string, provenance: Provenance = {}): Promise<Patch[]> {
+    const params = this.params(prefill, values, path);
+    if (isIncomplete(params)) return [];
+    const response = await this.cache.fetch(prefill.source, params);
+    const data = prefill.select ? getIn(response, prefill.select) : response;
+    const overwrite = prefill.overwrite ?? (prefill.trigger === "change" ? "unedited" : "always");
+    const base = formatPath(parsePath(path).slice(0, -1));
+    const out: Patch[] = [];
+    for (const [target, from] of Object.entries(prefill.fill)) {
+      const value = getIn(data, from);
+      const to = resolveRelativePath(target, base);
+      const who = provenance[to];
+      if (value !== undefined) {
+        // "unedited" keeps what the user typed, and values loaded without provenance.
+        const kept = overwrite === "unedited" && getIn(values, to) !== undefined && (who === undefined || who === USER_SOURCE);
+        if (!kept) out.push({ path: to, value, source: prefill.source });
+      } else if (who === prefill.source && getIn(values, to) !== undefined) out.push({ path: to, value: undefined });
+    }
+    return out;
+  }
+
+  // ============================================================== computed fields
+
+  /**
+   * One pass over the active fields: the writes their `x-compute`s want to make, each
+   * evaluated against the incoming `values` (no compute sees another's output).
+   * A readOnly field is always written. An editable one only while it is empty (and not
+   * cleared by the user) or still holds a computed value: the user's own edits win.
+   * Disabled fields are skipped (hidden ones aren't in the schema), and fields under a missing
+   * object wait for it to exist.
+   */
+  computed(values: unknown, provenance: Provenance = {}, disabled = this.disabledPaths(values)): Patch[] {
+    return this.computePass(values, provenance, disabled, false).patches;
+  }
+
+  /**
+   * One compute pass. With `readOnlyOnly`, editable (assistive) computes are ignored, which is
+   * what validation needs; `waiting` lists readOnly fields whose loader hasn't answered yet.
+   */
+  private computePass(
+    values: unknown,
+    provenance: Provenance,
+    disabled: Set<string>,
+    readOnlyOnly: boolean,
+  ): { patches: Patch[]; waiting: string[] } {
+    const out: Patch[] = [];
+    const waiting: string[] = [];
+    const walk = (node: unknown, path: string) => {
+      const r = this.resolve(node, path, values);
+      const s = r.schema;
+      const value = getIn(values, path);
+      const readOnly = s.readOnly === true;
+      if (s["x-compute"] && path && (readOnly || !readOnlyOnly)) {
+        const result = this.evalCompute(s["x-compute"], path, values, r.nullable);
+        const who = provenance[path];
+        const owned = who !== USER_SOURCE && (value === undefined || who === COMPUTE_SOURCE);
+        if (result === SKIP) {
+          if (readOnly) waiting.push(path);
+        } else if ((readOnly || owned) && !deepEqual(result, value))
+          out.push({ path, value: result, source: result === undefined ? undefined : COMPUTE_SOURCE });
+      }
+      if (value === undefined && path) return;
+      for (const k of Object.keys(s.properties ?? {})) {
+        const child = joinPath(path, k);
+        if (!disabled.has(child)) walk(s.properties[k], child);
+      }
+      if (s.items !== undefined && Array.isArray(value)) value.forEach((_, i) => walk(s.items, joinPath(path, i)));
+    };
+    walk(this.root, "");
+    return { patches: out, waiting };
+  }
+
+  /**
+   * Recompute every readOnly `x-compute` until settled, ignoring editable ones. A readOnly value
+   * is defined by its formula, so whatever the client sent for it is replaced.
+   */
+  private withDerived(values: unknown): { values: unknown; waiting: string[] } {
+    for (let pass = 0; ; pass++) {
+      const { patches, waiting } = this.computePass(values, {}, this.disabledPaths(values), true);
+      if (!patches.length) return { values, waiting };
+      if (pass >= MAX_COMPUTE_PASSES) {
+        const paths = [...new Set(patches.map((p) => p.path))].join(", ");
+        throw new Error(`x-compute never settles: ${paths}. Computed fields must not read each other in a cycle.`);
+      }
+      for (const p of patches) values = setIn(values, p.path, p.value);
+    }
+  }
+
+  /**
+   * Apply computes until nothing changes, so chains (a → b → c) settle in one call.
+   * The pure form for servers, tests and event handlers; the React layer calls it on every change.
+   * Throws when the computes keep rewriting each other, which means two of them read each other.
+   */
+  applyComputed(values: unknown, provenance: Provenance = {}): { values: unknown; provenance: Provenance; patches: Patch[] } {
+    const patches: Patch[] = [];
+    for (let pass = 0; ; pass++) {
+      const step = this.computed(values, provenance);
+      if (!step.length) return { values, provenance, patches };
+      if (pass >= MAX_COMPUTE_PASSES) {
+        const paths = [...new Set(step.map((p) => p.path))].join(", ");
+        throw new Error(`x-compute never settles: ${paths}. Computed fields must not read each other in a cycle.`);
+      }
+      for (const p of step) values = setIn(values, p.path, p.value);
+      provenance = withPatches(provenance, step);
+      patches.push(...step);
+    }
+  }
+
+  private evalCompute(compute: Compute, path: string, values: unknown, nullable: boolean): unknown {
+    let result: unknown;
+    if ("logic" in compute) result = jsonLogic.apply(compute.logic as any, this.scope(values, path));
+    else {
+      const entry = this.readAsync(compute, values, path);
+      if (entry.status === "loading" || entry.status === "error") return SKIP;
+      result = entry.status === "idle" ? undefined : entry.data;
+    }
+    // JSON Logic arithmetic on a missing input gives NaN; neither NaN nor (unless nullable) null is a value.
+    if (typeof result === "number" && Number.isNaN(result)) return undefined;
+    return result === null && !nullable ? undefined : result;
   }
 
   // ============================================================== resolution
@@ -160,7 +305,7 @@ export class FormEngine {
     for (const kind of ["oneOf", "anyOf"] as const) {
       if (!Array.isArray(s[kind])) continue;
       const raw: unknown[] = s[kind];
-      const branches = derived(this.derivedBranches, raw, () => raw.map((b) => deref(this.root, b)));
+      const branches: Schema[] = this.derivedMemo.get(`branches:${idOf(raw)}`, () => raw.map((b) => deref(this.root, b)));
       s = without(s, kind);
 
       // Nullable shorthand: anyOf: [X, { type: "null" }]
@@ -175,7 +320,7 @@ export class FormEngine {
       if (branches.every((b) => "const" in b)) {
         s = merge(
           s,
-          derived(this.derivedEnum, raw, () => ({
+          this.derivedMemo.get(`enum:${idOf(raw)}`, () => ({
             enum: branches.map((b) => b.const),
             "x-enumLabels": branches.map((b) => b.title ?? String(b.const)),
           })),
@@ -194,7 +339,7 @@ export class FormEngine {
         selected = consts.findIndex((c) => c === current);
         s = merge(
           s,
-          derived(this.derivedDisc, raw, () => ({
+          this.derivedMemo.get(`disc:${idOf(raw)}`, () => ({
             properties: { [discriminator]: { enum: consts, "x-enumLabels": titles } },
             required: [discriminator],
           })),
@@ -219,7 +364,30 @@ export class FormEngine {
       if (entry.status === "success") take(this.flatten(entry.data, path, values), ["title"]);
     }
 
+    if (s.properties) s = this.withoutHidden(s, path, values);
     return { schema: s, combinator, nullable, extend };
+  }
+
+  /**
+   * Drop properties whose `x-hidden` holds, as if they sat under an unmet `if`.
+   * Only the property's own schema (after $ref) is checked, so recursive schemas stay finite.
+   */
+  private withoutHidden(s: Schema, path: string, values: unknown): Schema {
+    const hidden = Object.keys(s.properties).filter((k) => this.holds(s.properties[k], "x-hidden", path, k, values));
+    if (!hidden.length) return s;
+    return this.derivedMemo.get(`hide:${idOf(s)}:${JSON.stringify(hidden)}`, () => {
+      const properties = { ...s.properties };
+      for (const k of hidden) delete properties[k];
+      const out: Schema = { ...s, properties };
+      if (Array.isArray(s.required)) out.required = s.required.filter((k: string) => !hidden.includes(k));
+      return out;
+    });
+  }
+
+  /** Does the `keyword` condition on child `key` of the object at `parent` hold? */
+  private holds(node: unknown, keyword: "x-hidden" | "x-disabled", parent: string, key: string | number, values: unknown) {
+    const cond = deref(this.root, node)[keyword] as Condition | undefined;
+    return cond !== undefined && this.evalCondition(cond, parent, values, joinPath(parent, key));
   }
 
   /** The (unresolved) schema node at `path`, or undefined if that field is not active right now. */
@@ -252,144 +420,153 @@ export class FormEngine {
     this.notifier.notify();
   }
 
+  /** Branch picks, for a draft snapshot. */
+  getSelections(): Record<string, number> {
+    return Object.fromEntries(this.selections);
+  }
+
+  /** Restore branch picks from a snapshot. */
+  restoreSelections(selections: Record<string, number> | undefined) {
+    this.selections = new Map(Object.entries(selections ?? {}));
+    this.notifier.notify();
+  }
+
   readOptions(schema: Schema, path: string, values: unknown): AsyncEntry<Option[]> | undefined {
     const ref = schema["x-options"] as AsyncSourceRef | undefined;
-    return ref ? (this.readAsync(ref, values, path) as AsyncEntry<Option[]>) : undefined;
+    return ref ? (this.readAsync(ref, values, path, []) as AsyncEntry<Option[]>) : undefined;
   }
 
-  // ============================================================== rules
+  // ============================================================== hidden / disabled
 
-  ruleState(rule: Rule | Rule[] | undefined, base: string, values: unknown): RuleState {
-    if (!rule) return RULE_STATES["00"]!;
-    let hidden = false;
-    let disabled = false;
-    for (const r of Array.isArray(rule) ? rule : [rule]) {
-      const hit = this.evalCondition(r.condition, base, values);
-      if (r.effect === "HIDE" && hit) hidden = true;
-      if (r.effect === "SHOW" && !hit) hidden = true;
-      if (r.effect === "DISABLE" && hit) disabled = true;
-      if (r.effect === "ENABLE" && !hit) disabled = true;
-    }
-    return RULE_STATES[`${+hidden}${+disabled}`]!;
-  }
-
-  evalCondition(cond: Condition, base: string, values: unknown): boolean {
-    if ("logic" in cond) return !!jsonLogic.apply(cond.logic as any, this.scope(values, base));
+  /**
+   * Evaluate an `x-hidden` / `x-disabled` condition for the field at `self`, held by the object
+   * at `base`: JSON Logic sees $self/$parent/$item of the field; a `path` test is relative to `base`.
+   */
+  evalCondition(cond: Condition, base: string, values: unknown, self = base): boolean {
+    if ("logic" in cond) return !!jsonLogic.apply(cond.logic as any, this.scope(values, self));
     return this.test(cond.schema, getIn(values, resolveRelativePath(cond.path, base)));
   }
 
-  /** Every data path whose control is hidden by a UI rule (directly or via a hidden layout). */
-  collectHidden(values: unknown): Set<string> {
-    const hidden = new Set<string>();
-    const walk = (el: UIElement, base: string, parentHidden: boolean) => {
-      const isHidden = parentHidden || this.ruleState(el.rule, base, values).hidden;
-      if (el.type === "Control") {
-        const path = resolveRelativePath(el.path, base);
-        if (isHidden) hidden.add(path);
-        const detail = el.options?.detail;
-        if (!detail || isHidden) return;
-        const v = getIn(values, path);
-        if (Array.isArray(v)) v.forEach((_, i) => walk(detail, joinPath(path, i), false));
-        else walk(detail, path, false);
-        return;
+  /** Is the field at `path`, or any field above it, disabled by `x-disabled`? */
+  disabledAt(path: string, values: unknown): boolean {
+    let node: unknown = this.root;
+    let cur = "";
+    for (const seg of parsePath(path)) {
+      const { schema } = this.resolve(node, cur, values);
+      const next = typeof seg === "number" ? schema.items : schema.properties?.[seg];
+      if (next === undefined || this.holds(next, "x-disabled", cur, seg, values)) return next !== undefined;
+      node = next;
+      cur = joinPath(cur, seg);
+    }
+    return false;
+  }
+
+  /**
+   * The topmost data paths disabled by `x-disabled` (fields under them are implied). These are
+   * treated like inactive fields: cleared, not validated, not submitted. Hidden fields need no
+   * list: `x-hidden` removes them from the resolved schema.
+   */
+  disabledPaths(values: unknown): Set<string> {
+    const out = new Set<string>();
+    const walk = (node: unknown, path: string) => {
+      const s = this.resolve(node, path, values).schema;
+      const value = getIn(values, path);
+      for (const k of Object.keys(s.properties ?? {})) {
+        const child = joinPath(path, k);
+        if (this.holds(s.properties[k], "x-disabled", path, k, values)) out.add(child);
+        else if (getIn(values, child) !== undefined) walk(s.properties[k], child);
       }
-      for (const child of el.elements) walk(child, base, isHidden);
+      if (s.items !== undefined && Array.isArray(value))
+        value.forEach((_, i) => {
+          const child = joinPath(path, i);
+          if (this.holds(s.items, "x-disabled", path, i, values)) out.add(child);
+          else walk(s.items, child);
+        });
     };
-    if (this.uischema) walk(this.uischema, "", false);
-    return hidden;
+    walk(this.root, "");
+    return out;
   }
 
   // ============================================================== validation
 
   /**
-   * Build a plain schema describing exactly what the user can see right now:
-   * combinators resolved, inactive branches and rule-hidden fields removed, and
-   * loaded option lists turned into enums. Validating against this gives precise
+   * Build a plain schema describing exactly what the user can use right now:
+   * combinators resolved, inactive branches and x-hidden/x-disabled fields removed,
+   * and loaded option lists turned into enums. Validating against this gives precise
    * per-field errors instead of "must match exactly one schema in oneOf".
+   *
+   * Fields without a value are not walked into: nothing below them can fail (a missing
+   * required field is reported by its parent), and this keeps recursive schemas finite.
    */
   concretize(
     values: unknown,
-    hidden = this.collectHidden(values),
+    disabled = this.disabledPaths(values),
   ): { schema: Schema; pending: string[]; failed: string[] } {
     const pending: string[] = [];
     const failed: string[] = [];
-    const walk = (node: unknown, path: string): { schema: Schema; key: string } => {
+    // `optionsPath` is where x-options params are evaluated: for a multi-select's items that
+    // is the array itself, matching what the UI loads.
+    const walk = (node: unknown, path: string, optionsPath = path): Schema => {
       const r = this.resolve(node, path, values);
       const s = r.schema;
       const value = getIn(values, path);
-      const keyParts: string[] = [String(idOf(s))];
+      const out: Schema = { ...without(s, ...STRIP_FOR_VALIDATION) };
+      if (value === undefined && path) return out;
+
       if (r.extend?.status === "loading") pending.push(path);
       if (r.extend?.status === "error") failed.push(path);
-
-      let properties: Record<string, Schema> | undefined;
-      let required: string[] | undefined;
       if (s.properties) {
-        properties = {};
-        for (const k of Object.keys(s.properties)) {
-          const p = joinPath(path, k);
-          if (hidden.has(p)) continue;
-          const child = walk(s.properties[k], p);
-          properties[k] = child.schema;
-          keyParts.push(`${k}:${child.key}`);
-        }
-        const req: string[] = (s.required ?? []).filter((k: string) => !hidden.has(joinPath(path, k)));
-        required = req;
-        keyParts.push(`r:${req.join(",")}`);
+        const visible = Object.keys(s.properties).filter((k) => !disabled.has(joinPath(path, k)));
+        out.properties = Object.fromEntries(visible.map((k) => [k, walk(s.properties[k], joinPath(path, k))]));
+        const required = (s.required ?? []).filter((k: string) => !disabled.has(joinPath(path, k)));
+        if (required.length) out.required = required;
       }
-
-      let items: Schema | Schema[] | undefined;
       if (s.items !== undefined) {
+        // One concrete schema per item, since conditions can differ between items.
         if (Array.isArray(value)) {
-          const kids = value.map((_, i) => walk(s.items, joinPath(path, i)));
-          items = kids.map((k) => k.schema);
-          keyParts.push(`[${kids.map((k) => k.key).join(",")}]`);
-        } else {
-          const t = walk(s.items, joinPath(path, 0));
-          items = t.schema;
-          keyParts.push(`t:${t.key}`);
-        }
-      }
-
-      let optionValues: unknown[] | undefined;
-      const opts = this.readOptions(s, path, values);
-      if (opts?.status === "loading") pending.push(path);
-      if (opts?.status === "success") {
-        optionValues = opts.data.map((o) => o.value);
-        keyParts.push(`o:${idOf(opts)}`);
-      }
-      if (r.nullable) keyParts.push("null");
-
-      const key = keyParts.join(";");
-      const schema = this.concreteMemo.get(key, () => {
-        const out: Schema = { ...without(s, ...STRIP_FOR_VALIDATION) };
-        if (properties) out.properties = properties;
-        if (required?.length) out.required = required;
-        if (Array.isArray(items)) {
-          out.items = items;
+          out.items = value.map((_, i) => walk(s.items, joinPath(path, i), path));
           out.additionalItems = false;
-        } else if (items) out.items = items;
-        if (optionValues) out.enum = optionValues;
-        if (r.nullable) {
-          if (out.type) out.type = [...new Set([...[out.type].flat(), "null"])];
-          if (out.enum) out.enum = [...out.enum, null];
         }
-        return out;
-      });
-      return { schema, key };
+      }
+      const opts = (s["x-options"] as AsyncSourceRef | undefined)?.strict !== false && this.readOptions(s, optionsPath, values);
+      if (opts && opts.status === "loading") pending.push(path);
+      if (opts && opts.status === "success") out.enum = opts.data.map((o) => o.value);
+      if (r.nullable) {
+        if (out.type) out.type = [...new Set([...[out.type].flat(), "null"])];
+        if (out.enum) out.enum = [...out.enum, null];
+      }
+      return out;
     };
 
-    const { schema } = walk(this.root, "");
-    return { schema, pending, failed };
+    const schema = walk(this.root, "");
+    return { schema: this.concreteMemo.get(JSON.stringify(schema), () => schema), pending, failed };
   }
 
+  /**
+   * Paths that hold a value but whose field is gone (inactive branch, unmet `if`, x-hidden
+   * or x-disabled). Parts still loading are left alone: their fields aren't known yet.
+   */
+  staleValues(values: unknown): string[] {
+    const { schema, pending, failed } = this.concretize(values);
+    const loading = [...pending, ...failed];
+    const stale: string[] = [];
+    prune(values, schema, (path) => {
+      if (!loading.some((p) => isWithin(path, p))) stale.push(path);
+    });
+    return stale;
+  }
+
+  /**
+   * Validate `values` and return the clean data to submit. readOnly computed fields are
+   * recomputed first, so a tampered or stale derived value can't get through; editable
+   * computes and prefills are assistive and left as sent.
+   */
   validate(values: unknown): ValidationResult & { data: unknown } {
+    const derived = this.withDerived(values);
+    values = derived.values;
     const { schema, pending, failed } = this.concretize(values);
     const data = prune(values, schema);
-    let fn = this.validators.get(schema);
-    if (!fn) {
-      fn = this.ajv.compile({ ...schema, definitions: this.root.definitions, $defs: this.root.$defs });
-      this.validators.set(schema, fn);
-    }
+    const fn = this.compile(schema);
     const ok = fn(data) as boolean;
     const fields: Record<string, string> = {};
     let form: string | undefined;
@@ -402,8 +579,8 @@ export class FormEngine {
       else fields[name] ??= msg;
     }
     if (failed.length) form ??= "Part of this form failed to load. Please retry.";
-    if (pending.length) form ??= "Some fields are still loading…";
-    return { valid: ok && !pending.length && !failed.length, fields, form, data };
+    if (pending.length || derived.waiting.length) form ??= "Some fields are still loading…";
+    return { valid: ok && !pending.length && !failed.length && !derived.waiting.length, fields, form, data };
   }
 
   private messageFor(e: ErrorObject): string {
@@ -456,19 +633,20 @@ function findDiscriminator(root: Schema, branches: Schema[]): string | undefined
   return undefined;
 }
 
-/** Keep only values that the concrete schema describes. */
-export function prune(value: unknown, schema: Schema | undefined): unknown {
+/** Keep only values that the concrete schema describes; `onDrop` hears each removed path. */
+export function prune(value: unknown, schema: Schema | undefined, onDrop?: (path: string) => void, path = ""): unknown {
   if (!schema || value === undefined) return value;
   if (Array.isArray(value)) {
     const items = schema.items;
     if (!items) return value;
-    return value.map((v, i) => prune(v, Array.isArray(items) ? items[i] : items));
+    return value.map((v, i) => prune(v, Array.isArray(items) ? items[i] : items, onDrop, joinPath(path, i)));
   }
   if (value && typeof value === "object" && schema.properties) {
     const out: Record<string, unknown> = {};
-    for (const k of Object.keys(schema.properties)) {
-      const v = (value as any)[k];
-      if (v !== undefined) out[k] = prune(v, schema.properties[k]);
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      if (k in schema.properties) out[k] = prune(v, schema.properties[k], onDrop, joinPath(path, k));
+      else onDrop?.(joinPath(path, k));
     }
     return out;
   }

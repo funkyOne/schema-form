@@ -13,10 +13,88 @@ export type JsonLogic = unknown;
  *
  * Each param is a JSON Logic expression evaluated against the form values.
  * If any param evaluates to null/undefined/"" the source is "idle" and nothing is fetched.
+ *
+ * `select` picks part of the response by path ("cities", "lists.postcodes"), so one call can
+ * feed several fields: refs with the same source and params share a single request.
+ * A missing part reads as an empty list (x-options) or no extra fields (x-extend).
  */
 export interface AsyncSourceRef {
   source: string;
   params?: Record<string, JsonLogic>;
+  select?: string;
+  /**
+   * x-options only. By default the loaded list is enforced: the value must be one of it and
+   * is cleared when it isn't. `false` keeps the list for display only, so values that arrive
+   * from elsewhere (an import, an older draft, a lookup) are kept and validated by the
+   * field's own keywords.
+   */
+  strict?: boolean;
+}
+
+/**
+ * Fetch data for a field's value and write it into other fields. Declared on the field whose
+ * value drives the fetch:
+ *   "x-prefill": { "source": "company", "params": { "number": { "var": "$self" } },
+ *                  "fill": { "companyName": "name", "/address.postcode": "address.postcode" } }
+ * `fill` maps target field paths (relative to the object holding the field, "/" = absolute) to
+ * paths in the response. Only targets the response has a value for are written.
+ *
+ * Assistive, not validation: it only suggests values, which are then validated like any other.
+ * A validating engine (e.g. on the server) may ignore it.
+ */
+export interface Prefill extends AsyncSourceRef {
+  fill: Record<string, string>;
+  /**
+   * "button" (default): a button next to the field runs it.
+   * "change": runs automatically whenever its params change and are all filled in.
+   */
+  trigger?: "button" | "change";
+  /**
+   * Which targets the response may overwrite (default: "always" for a button, "unedited" on change):
+   * - "always": every target the response has a value for.
+   * - "unedited": only targets that are empty or were last written by a prefill or compute;
+   *   values the user typed, or loaded without provenance, are kept.
+   */
+  overwrite?: "always" | "unedited";
+  /** Button text (default "Look up"). */
+  label?: string;
+}
+
+/**
+ * Derive a field's value from other fields, declared on the field it writes:
+ *   "x-compute": { "logic": { "*": [{ "var": "$parent.qty" }, { "var": "$parent.price" }] } }
+ *   "x-compute": { "source": "pricing", "params": { "product": { "var": "product" } }, "select": "total" }
+ *
+ * A `readOnly` field is always derived. An editable one is filled while it is untouched or
+ * still holds the computed value; once the user edits or clears it, their value wins (see Provenance).
+ * The field a compute sits on is the only field it writes, so ownership can't overlap.
+ */
+export type Compute = { logic: JsonLogic } | AsyncSourceRef;
+
+/** Provenance entries written by the engine ("compute") and by the React layer on a manual edit ("user"). */
+export const COMPUTE_SOURCE = "compute";
+export const USER_SOURCE = "user";
+
+/**
+ * Who last wrote each field: "compute", a prefill's source name, or "user" for a manual edit
+ * (including clearing it). No entry means nobody has touched it since it was loaded.
+ * Kept as data next to the values so drafts preserve it.
+ */
+export type Provenance = Record<string, string>;
+
+/** One write to a field. `source` is recorded in Provenance; undefined = forget it. */
+export interface Patch {
+  path: string;
+  value: unknown;
+  source?: string;
+}
+
+/** Everything needed to resume a form: save it as a draft or browser backup. */
+export interface FormSnapshot {
+  values: unknown;
+  provenance?: Provenance;
+  /** Branch picks for oneOf/anyOf without a discriminator, by field path. */
+  selections?: Record<string, number>;
 }
 
 export interface Option {
@@ -38,37 +116,42 @@ export type AsyncEntry<T = unknown> =
   | { status: "success"; data: T }
   | { status: "error"; error: unknown; retry: () => void };
 
-// ---------------------------------------------------------------- UI schema
+// ---------------------------------------------------------------- conditions
 
-export type Effect = "HIDE" | "SHOW" | "DISABLE" | "ENABLE";
-
+/**
+ * A condition on a schema property, used by `x-hidden` and `x-disabled`:
+ *   "x-hidden":   { "logic": { "!": { "var": "$parent.marketingConsent" } } }
+ *   "x-disabled": { "path": "vatRegistered", "schema": { "not": { "const": true } } }
+ *
+ * `logic` is JSON Logic against { ...rootValues, $self, $parent, $item }, evaluated at the
+ * property's own path. `path` + `schema` tests the value at `path` (relative to the object
+ * holding the property, "/" = absolute) against a JSON Schema.
+ *
+ * x-hidden: while true the property is not part of the schema at all, exactly like a property
+ *   under an unmet `if`: not rendered, not required, not validated, value cleared.
+ * x-disabled: while true the field (and everything under it) is shown locked, is not validated
+ *   or submitted, and its value is cleared.
+ */
 export type Condition =
-  /** JSON Logic against { ...rootValues, $item, $parent } */
   | { logic: JsonLogic }
-  /** JSON Schema test of the value at `path` (relative to the current base, "/" = absolute) */
   | { path: string; schema: Schema };
 
-export interface Rule {
-  effect: Effect;
-  condition: Condition;
-}
+// ---------------------------------------------------------------- UI schema (layout only)
 
-interface UIBase {
-  rule?: Rule | Rule[];
-}
+// Visibility and locking live in the schema (x-hidden / x-disabled); the UI schema is layout only.
 
-export interface LayoutElement extends UIBase {
+export interface LayoutElement {
   type: "VerticalLayout" | "HorizontalLayout";
   elements: UIElement[];
 }
 
-export interface GroupElement extends UIBase {
+export interface GroupElement {
   type: "Group";
   label?: string;
   elements: UIElement[];
 }
 
-export interface ControlElement extends UIBase {
+export interface ControlElement {
   type: "Control";
   /** Data path, e.g. "address.city". Relative to the current array item / object detail. */
   path: string;
@@ -109,10 +192,15 @@ export interface Resolved {
   extend?: AsyncEntry;
 }
 
-export interface ValidationResult {
-  valid: boolean;
+/** Errors by field path plus an optional form-level message: what validation produces and what a server may return. */
+export interface FormErrors {
   /** Errors keyed by TanStack field name ("a.b[0].c"). */
-  fields: Record<string, string>;
-  /** Errors that don't belong to a field (root errors, pending loads). */
+  fields?: Record<string, string>;
+  /** An error that doesn't belong to a field (root errors, pending loads, a rejected submission). */
   form?: string;
+}
+
+export interface ValidationResult extends FormErrors {
+  valid: boolean;
+  fields: Record<string, string>;
 }

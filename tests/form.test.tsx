@@ -31,7 +31,7 @@ describe("<SchemaForm>", () => {
     expect(screen.getByLabelText(/^Company name/)).toBeTruthy();
   });
 
-  it("disables and hides fields from UI rules", async () => {
+  it("disables and hides fields from x-disabled / x-hidden", async () => {
     const { user } = setup();
     await user.click(screen.getByLabelText("A company"));
     expect(screen.getByLabelText(/^VAT number/)).toBeDisabled();
@@ -115,6 +115,7 @@ describe("<SchemaForm>", () => {
       contact: { phone: "0161 555 0100" },
       hasPreviousClaims: true,
       claims: [{ year: 2021, type: "other", amount: 1200, description: "Hail" }],
+      claimsTotal: 1200,
       marketingConsent: false,
     });
   });

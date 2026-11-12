@@ -1,6 +1,7 @@
+import { batch, type Store } from "@tanstack/store";
 import { createContext, useCallback, useContext, useMemo, useRef, type ReactNode } from "react";
 import { useSyncExternalStoreWithSelector } from "use-sync-external-store/shim/with-selector";
-import type { FormEngine } from "../engine";
+import { USER_SOURCE, withPatches, withSource, withoutIndex, withoutPath, type FormEngine, type Patch, type Provenance } from "../engine";
 import type { RendererEntry } from "./controls";
 
 /**
@@ -14,13 +15,34 @@ interface FormContextValue {
   form: SchemaFormApi;
   engine: FormEngine;
   renderers: RendererEntry[];
+  /** Who last wrote each field (computes, prefills). Lives next to the values, saved in snapshots. */
+  provenance: Store<Provenance>;
 }
 
-const FormContext = createContext<FormContextValue | null>(null);
-
-export function FormProvider({ value, children }: { value: FormContextValue; children: ReactNode }) {
-  return <FormContext.Provider value={value}>{children}</FormContext.Provider>;
+/** Write engine patches (computes, prefills, clearing) into the form and record their sources. */
+export function applyPatches(ctx: Pick<FormContextValue, "form" | "provenance">, patches: readonly Patch[]) {
+  if (!patches.length) return;
+  // One batch, so stale-value clearing sees the final values, whatever order the patches come in.
+  batch(() => {
+    for (const p of patches) ctx.form.setFieldValue(p.path, p.value, { dontUpdateMeta: true });
+    ctx.provenance.setState((prev) => withPatches(prev, patches));
+  });
 }
+
+/** The user edited (or cleared) `path` themselves: computes leave it alone from now on. */
+export function markManual(provenance: Store<Provenance>, path: string) {
+  if (provenance.state[path] !== USER_SOURCE) provenance.setState((prev) => withSource(prev, path, USER_SOURCE));
+}
+
+/** A value disappeared (stale) or an array item was removed. */
+export function forgetPath(provenance: Store<Provenance>, path: string) {
+  provenance.setState((prev) => withoutPath(prev, path));
+}
+export function forgetIndex(provenance: Store<Provenance>, arrayPath: string, index: number) {
+  provenance.setState((prev) => withoutIndex(prev, arrayPath, index));
+}
+
+export const FormContext = createContext<FormContextValue | null>(null);
 
 /** Access the form, engine and renderers from inside a custom renderer. */
 export function useSchemaForm(): FormContextValue {
@@ -34,7 +56,7 @@ export function useSchemaForm(): FormContextValue {
 interface BaseValue {
   /** Base for relative UI-schema paths: "" at the root, "claims[2]" inside an array item. */
   base: string;
-  /** Set by a DISABLE rule on an ancestor layout/control. */
+  /** Set when an ancestor field is disabled by `x-disabled`. */
   disabled: boolean;
 }
 

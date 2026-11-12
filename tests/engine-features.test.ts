@@ -1,16 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createQueryClient,
   FormEngine,
+  QUERY_KEY,
   formatPath,
   getIn,
   joinPath,
   parsePath,
   parsePointer,
   prune,
+  pruneProvenance,
   resolveRelativePath,
+  withSource,
+  withoutIndex,
+  withoutPath,
   type Loaders,
   type Schema,
-  type UIElement,
 } from "../src/engine";
 
 /**
@@ -88,6 +93,18 @@ describe("$ref and allOf", () => {
       },
     });
     expect(props(e, "child.child.child", {})).toEqual(["name", "child"]);
+  });
+
+  it("validates recursive schemas", () => {
+    const e = new FormEngine({
+      schema: {
+        definitions: {
+          node: { type: "object", properties: { name: { type: "string" }, child: { $ref: "#/definitions/node" } }, required: ["name"] },
+        },
+        $ref: "#/definitions/node",
+      },
+    });
+    expect(e.validate({ name: "a", child: { name: "b", child: {} } }).fields).toEqual({ "child.child.name": "This field is required" });
   });
 
   it("throws on $ref cycles and unresolvable refs", () => {
@@ -239,13 +256,10 @@ describe("validation messages and pruning", () => {
 
   it("removes inactive and hidden data but keeps it in the input", () => {
     const e = new FormEngine({
-      schema: { type: "object", properties: { show: { type: "boolean" }, extra: { type: "string" } }, required: ["extra"] },
-      uischema: {
-        type: "VerticalLayout",
-        elements: [
-          { type: "Control", path: "show" },
-          { type: "Control", path: "extra", rule: { effect: "SHOW", condition: { logic: { var: "show" } } } },
-        ],
+      schema: {
+        type: "object",
+        properties: { show: { type: "boolean" }, extra: { type: "string", "x-hidden": { logic: { "!": { var: "show" } } } } },
+        required: ["extra"],
       },
     });
     const values = { show: false, extra: "x" };
@@ -305,37 +319,62 @@ describe("async sources", () => {
     expect(err?.status).toBe("error");
     expect(e.validate({ parent: "a" }).form).toBeUndefined(); // option errors don't block validation
 
+    expect(read({ parent: "a" })).toBe(err); // a failed query waits for retry
     fail = false;
     const notified = vi.fn();
     e.notifier.subscribe(notified);
     if (err?.status === "error") err.retry();
-    expect(notified).toHaveBeenCalled();
     expect(read({ parent: "a" })?.status).toBe("loading");
     await flush();
+    expect(notified).toHaveBeenCalled();
     expect(read({ parent: "a" })?.status).toBe("success");
   });
 
-  it("reports a missing loader as an error", () => {
+  it("reports a missing loader as an error", async () => {
     const e = new FormEngine({ schema: { properties: { x: { "x-options": { source: "nope" } } } } });
+    e.readOptions(at(e, "x", {}).schema, "x", {});
+    await flush();
     const entry = e.readOptions(at(e, "x", {}).schema, "x", {});
     expect(entry?.status).toBe("error");
     expect(entry?.status === "error" && String(entry.error)).toMatch(/No loader registered for source "nope"/);
   });
 
-  it("invalidates entries, aborting requests in flight and ignoring their results", async () => {
-    let signal: AbortSignal | undefined;
+  it("refetches after invalidateQueries, showing the old data meanwhile", async () => {
     let n = 0;
-    const { e, read } = setup(async (_p, ctx) => {
-      signal = ctx.signal;
-      return [{ value: ++n, label: String(n) }];
-    });
+    const { e, read } = setup(async () => [{ value: ++n, label: String(n) }]);
     read({ parent: "a" });
-    e.cache.invalidate("list");
-    expect(signal?.aborted).toBe(true);
-    expect(read({ parent: "a" })?.status).toBe("loading");
+    await flush();
+    const first = read({ parent: "a" });
+    expect(read({ parent: "a" })).toBe(first); // stable while unchanged
+    await e.queryClient.invalidateQueries({ queryKey: [QUERY_KEY, "list"] });
+    expect(read({ parent: "a" })).toBe(first);
     await flush();
     const entry = read({ parent: "a" });
     expect(entry?.status === "success" && entry.data).toEqual([{ value: 2, label: "2" }]);
+  });
+
+  it("passes an abort signal that fires when the query is cancelled", async () => {
+    let signal: AbortSignal | undefined;
+    const { e, read } = setup((_p, ctx) => {
+      signal = ctx.signal;
+      return new Promise(() => {});
+    });
+    read({ parent: "a" });
+    await e.queryClient.cancelQueries();
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("shares results between engines that share a query client", async () => {
+    const queryClient = createQueryClient();
+    const loader = vi.fn(async () => [{ value: 1, label: "One" }]);
+    const make = () =>
+      new FormEngine({ schema: { properties: { c: { "x-options": { source: "s" } } } }, loaders: { s: loader }, queryClient });
+    const a = make();
+    a.readOptions(at(a, "c", {}).schema, "c", {});
+    await flush();
+    const b = make();
+    expect(b.readOptions(at(b, "c", {}).schema, "c", {})?.status).toBe("success");
+    expect(loader).toHaveBeenCalledTimes(1);
   });
 
   it("blocks validation while an x-extend fragment is loading or failed", async () => {
@@ -349,18 +388,19 @@ describe("async sources", () => {
         },
       },
     });
-    expect(e.validate({}).form).toMatch(/still loading/);
+    expect(e.validate({ d: {} }).form).toMatch(/still loading/);
     await flush();
-    expect(e.validate({}).fields["d.z"]).toBe("This field is required");
+    expect(e.validate({ d: {} }).fields["d.z"]).toBe("This field is required");
 
     fail = true;
-    e.cache.invalidate();
-    e.validate({});
+    await e.queryClient.invalidateQueries();
+    e.validate({ d: {} });
     await flush();
     const r = e.validate({ d: { z: "ok" } });
     expect(r.valid).toBe(false);
     expect(r.form).toMatch(/failed to load/);
     expect(at(e, "d", {}).extend?.status).toBe("error");
+    expect(e.validate({}).valid).toBe(true); // an absent object has nothing left to load
   });
 
   it("evaluates $self, $parent and $item in params", async () => {
@@ -388,67 +428,294 @@ describe("async sources", () => {
   });
 });
 
-describe("rules", () => {
-  const e = new FormEngine({ schema: { properties: {} } });
+describe("x-hidden / x-disabled", () => {
   const yes = { logic: true };
   const no = { logic: false };
+  const flagged = (cond: object) =>
+    new FormEngine({
+      schema: { properties: { flag: { type: "boolean" }, group: { type: "object", properties: { flag: { type: "boolean" }, x: { type: "string", "x-hidden": cond } } } } },
+    });
 
-  it("combines HIDE / SHOW / DISABLE / ENABLE", () => {
-    expect(e.ruleState(undefined, "", {})).toEqual({ hidden: false, disabled: false });
-    expect(e.ruleState({ effect: "HIDE", condition: yes }, "", {})).toEqual({ hidden: true, disabled: false });
-    expect(e.ruleState({ effect: "HIDE", condition: no }, "", {}).hidden).toBe(false);
-    expect(e.ruleState({ effect: "ENABLE", condition: no }, "", {})).toEqual({ hidden: false, disabled: true });
-    expect(e.ruleState({ effect: "ENABLE", condition: yes }, "", {}).disabled).toBe(false);
-    expect(
-      e.ruleState(
-        [
-          { effect: "SHOW", condition: no },
-          { effect: "DISABLE", condition: yes },
-        ],
-        "",
-        {},
-      ),
-    ).toEqual({ hidden: true, disabled: true });
+  it("removes hidden properties from the resolved schema and its required list", () => {
+    const e = new FormEngine({
+      schema: { type: "object", properties: { a: { type: "string", "x-hidden": yes }, b: { type: "string", "x-hidden": no } }, required: ["a", "b"] },
+    });
+    const r = e.resolve(e.root, "", {}).schema;
+    expect(Object.keys(r.properties)).toEqual(["b"]);
+    expect(r.required).toEqual(["b"]);
+    expect(e.resolve(e.root, "", {})).toBe(e.resolve(e.root, "", { other: 1 }));
   });
 
-  it("returns the same object for the same state", () => {
-    const a = e.ruleState({ effect: "HIDE", condition: { logic: { var: "x" } } }, "", { x: 1 });
-    const b = e.ruleState({ effect: "HIDE", condition: { logic: { var: "x" } } }, "", { x: 2 });
-    expect(a).toBe(b);
-  });
-
-  it("resolves schema-condition paths relative to the base, or absolute with /", () => {
+  it("resolves schema-condition paths relative to the holding object, or absolute with /", () => {
     const vals = { flag: true, group: { flag: false } };
-    const rel = { effect: "HIDE", condition: { path: "flag", schema: { const: true } } } as const;
-    const abs = { effect: "HIDE", condition: { path: "/flag", schema: { const: true } } } as const;
-    expect(e.ruleState(rel, "group", vals).hidden).toBe(false);
-    expect(e.ruleState(abs, "group", vals).hidden).toBe(true);
-    expect(e.ruleState({ effect: "HIDE", condition: { logic: { var: "$parent.flag" } } }, "group.x", vals).hidden).toBe(false);
+    expect(flagged({ path: "flag", schema: { const: true } }).schemaAt("group.x", vals)).toBeDefined();
+    expect(flagged({ path: "/flag", schema: { const: true } }).schemaAt("group.x", vals)).toBeUndefined();
+    expect(flagged({ logic: { var: "$parent.flag" } }).schemaAt("group.x", vals)).toBeDefined();
+    expect(flagged({ logic: { var: "flag" } }).schemaAt("group.x", vals)).toBeUndefined();
   });
 
-  it("collects controls hidden directly, by a hidden layout, or inside object details", () => {
-    const uischema: UIElement = {
-      type: "VerticalLayout",
-      elements: [
-        { type: "Group", rule: { effect: "HIDE", condition: yes }, elements: [{ type: "Control", path: "a" }] },
-        {
-          type: "Control",
-          path: "obj",
-          options: {
-            detail: { type: "VerticalLayout", elements: [{ type: "Control", path: "inner", rule: { effect: "HIDE", condition: { logic: { var: "$parent.off" } } } }] },
+  it("applies x-hidden inside if/then, $ref targets and fetched fragments", async () => {
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        definitions: { hiddenStr: { type: "string", "x-hidden": yes } },
+        properties: { r: { $ref: "#/definitions/hiddenStr" }, d: { type: "object", "x-extend": { source: "f" } } },
+        if: { properties: {} },
+        then: { properties: { t: { type: "string", "x-hidden": yes } } },
+      },
+      loaders: { f: async () => ({ properties: { inner: { type: "string", "x-hidden": yes }, keep: { type: "string" } } }) },
+    });
+    const v = { d: {} };
+    e.resolve(e.schemaAt("d", v), "d", v);
+    await flush();
+    expect(Object.keys(e.resolve(e.root, "", v).schema.properties)).toEqual(["d"]);
+    expect(Object.keys(e.resolve(e.schemaAt("d", v), "d", v).schema.properties)).toEqual(["keep"]);
+  });
+
+  it("lists the topmost disabled paths, per array item, including fields with no value", () => {
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          off: { type: "string", "x-disabled": yes },
+          obj: { type: "object", "x-disabled": { logic: { var: "lock" } }, properties: { inner: { type: "string" } } },
+          rows: { type: "array", items: { type: "object", properties: { n: { type: "integer", "x-disabled": { logic: { "==": [{ var: "$parent.kind" }, "fixed"] } } }, kind: { type: "string" } } } },
+        },
+      },
+    });
+    const v = { obj: { inner: "x" }, rows: [{ kind: "fixed" }, { kind: "free" }] };
+    expect([...e.disabledPaths(v)].sort()).toEqual(["off", "rows[0].n"]);
+    expect([...e.disabledPaths({ ...v, lock: true })].sort()).toEqual(["obj", "off", "rows[0].n"]);
+    expect(e.disabledAt("obj.inner", { ...v, lock: true })).toBe(true);
+    expect(e.disabledAt("obj.inner", v)).toBe(false);
+    expect(e.disabledAt("rows[1].n", v)).toBe(false);
+  });
+
+  it("applies x-disabled inside fetched fragments", async () => {
+    const e = new FormEngine({
+      schema: { type: "object", properties: { lock: { type: "boolean" }, d: { type: "object", "x-extend": { source: "f" } } } },
+      loaders: {
+        f: async () => ({
+          properties: { inner: { type: "string", minLength: 5, "x-disabled": { logic: { var: "lock" } } }, keep: { type: "string" } },
+          required: ["inner"],
+        }),
+      },
+    });
+    const v = { lock: true, d: { inner: "x", keep: "k" } };
+    e.validate(v);
+    await flush();
+    expect([...e.disabledPaths(v)]).toEqual(["d.inner"]);
+    expect(e.staleValues(v)).toEqual(["d.inner"]);
+    expect(e.validate(v)).toMatchObject({ valid: true, data: { lock: true, d: { keep: "k" } } });
+    expect(e.validate({ ...v, lock: false })).toMatchObject({ valid: false, fields: { "d.inner": expect.any(String) } });
+  });
+
+  it("applies x-hidden to properties of the active oneOf branch", () => {
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          p: {
+            type: "object",
+            properties: { kind: { type: "string" } },
+            oneOf: [
+              {
+                properties: { kind: { const: "a" }, short: { type: "boolean" }, x: { type: "string", "x-hidden": { logic: { var: "$parent.short" } } } },
+                required: ["x"],
+              },
+              { properties: { kind: { const: "b" }, y: { type: "string" } } },
+            ],
           },
         },
-        {
-          type: "Control",
-          path: "gone",
-          rule: { effect: "HIDE", condition: yes },
-          options: { detail: { type: "Control", path: "never" } },
+      },
+    });
+    const keys = (v: object) => Object.keys(e.resolve(e.schemaAt("p", v), "p", v).schema.properties);
+    expect(keys({ p: { kind: "a" } })).toEqual(["kind", "short", "x"]);
+    expect(keys({ p: { kind: "a", short: true } })).toEqual(["kind", "short"]);
+    expect(e.validate({ p: { kind: "a" } }).fields).toEqual({ "p.x": "This field is required" });
+    const short = { p: { kind: "a", short: true, x: "gone" } };
+    expect(e.staleValues(short)).toEqual(["p.x"]);
+    expect(e.validate(short)).toMatchObject({ valid: true, data: { p: { kind: "a", short: true } } });
+  });
+});
+
+describe("multi-select options", () => {
+  it("validates against options loaded with the same params as the UI", async () => {
+    const loader = vi.fn(async (p: Record<string, unknown>) => (p.group === "g" ? [{ value: "a", label: "A" }] : []));
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          group: { type: "string" },
+          tags: { type: "array", items: { type: "string", "x-options": { source: "tags", params: { group: { var: "$parent.group" } } } } },
         },
-      ],
+      },
+      loaders: { tags: loader },
+    });
+    const v = { group: "g", tags: ["a", "zzz"] };
+    e.validate(v);
+    await flush();
+    expect(loader).toHaveBeenCalledWith({ group: "g" }, expect.anything());
+    expect(e.validate(v).fields["tags[1]"]).toBe("Please choose one of the options");
+  });
+});
+
+describe("one response feeding several fields (select)", () => {
+  const regionSchema = (extra: Schema = {}): Schema => {
+    const ref = (select: string) => ({ source: "region", params: { country: { var: "country" } }, select });
+    return {
+      type: "object",
+      properties: {
+        country: { type: "string" },
+        city: { type: "string", "x-options": ref("cities") },
+        postcode: { type: "string", "x-options": ref("lists.postcodes") },
+        district: { type: "string", "x-options": ref("districts") },
+        ...extra,
+      },
     };
-    const eng = new FormEngine({ schema: { properties: {} }, uischema });
-    expect([...eng.collectHidden({ obj: { off: true } })].sort()).toEqual(["a", "gone", "obj.inner"]);
-    expect([...eng.collectHidden({ obj: { off: false } })].sort()).toEqual(["a", "gone"]);
+  };
+  const region = async () => ({
+    cities: [{ value: "Paris", label: "Paris" }],
+    lists: { postcodes: [{ value: "75001", label: "75001" }] },
+    fields: { properties: { vat: { type: "string" } }, required: ["vat"] },
+  });
+
+  it("makes one call and gives each field its own part, empty when missing", async () => {
+    const loader = vi.fn(region);
+    const e = new FormEngine({ schema: regionSchema(), loaders: { region: loader } });
+    const v = { country: "FR" };
+    const read = (f: string) => e.readOptions(at(e, f, v).schema, f, v);
+    ["city", "postcode", "district"].forEach(read);
+    await flush();
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(read("city")).toEqual({ status: "success", data: [{ value: "Paris", label: "Paris" }] });
+    expect(read("postcode")).toEqual({ status: "success", data: [{ value: "75001", label: "75001" }] });
+    expect(read("district")).toEqual({ status: "success", data: [] });
+    expect(read("city")).toBe(read("city"));
+    expect(e.validate({ country: "FR", city: "Lyon" }).fields.city).toBe("Please choose one of the options");
+  });
+
+  it("works for x-extend too", async () => {
+    const loader = vi.fn(region);
+    const e = new FormEngine({
+      schema: regionSchema({ tax: { type: "object", "x-extend": { source: "region", params: { country: { var: "country" } }, select: "fields" } } }),
+      loaders: { region: loader },
+    });
+    const v = { country: "FR", tax: {} };
+    e.validate(v);
+    await flush();
+    expect(e.validate(v).fields["tax.vat"]).toBe("This field is required");
+    e.readOptions(at(e, "city", v).schema, "city", v);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("x-prefill", () => {
+  const prefill = {
+    source: "company",
+    params: { number: { var: "$self" } },
+    select: "result",
+    fill: { name: "name" },
+  };
+  const make = (loader = vi.fn(async (p: Record<string, unknown>): Promise<unknown> => ({ result: { name: `Co ${p.number}`, address: { city: "Leeds" } } }))) => ({
+    loader,
+    e: new FormEngine({ schema: { properties: {} }, loaders: { company: loader } }),
+  });
+
+  it("maps response paths to fields relative to the holding object, skipping missing values", async () => {
+    const { e } = make();
+    const values = { rows: [{ number: "42" }] };
+    expect(await e.prefill({ ...prefill, fill: { name: "name", "/owner.city": "address.city", missing: "nope" } }, values, "rows[0].number")).toEqual([
+      { path: "rows[0].name", value: "Co 42", source: "company" },
+      { path: "owner.city", value: "Leeds", source: "company" },
+    ]);
+  });
+
+  it("clears fields it filled before when the new response lacks them, never the user's", async () => {
+    const { e } = make(vi.fn(async () => ({ result: { name: "Only name" } })));
+    const fill = { name: "name", city: "address.city", street: "address.street" };
+    const values = { number: "1", name: "old", city: "Leeds", street: "Typed by hand" };
+    expect(await e.prefill({ ...prefill, fill }, values, "number", { city: "company", street: "other" })).toEqual([
+      { path: "name", value: "Only name", source: "company" },
+      { path: "city", value: undefined },
+    ]);
+  });
+
+  it("with overwrite: unedited, keeps typed and loaded values but replaces its own and computed ones", async () => {
+    const { e } = make(vi.fn(async () => ({ result: { a: "A", b: "B", c: "C", d: "D", f: "F" } })));
+    const fill = { a: "a", b: "b", c: "c", d: "d", f: "f" };
+    // a: typed by the user, b: loaded (no provenance), c: filled by this prefill, d: computed, f: empty
+    const values = { number: "1", a: "typed", b: "loaded", c: "old", d: "calc" };
+    const prov = { a: "user", c: "company", d: "compute" };
+    const own = [
+      { path: "c", value: "C", source: "company" },
+      { path: "d", value: "D", source: "company" },
+      { path: "f", value: "F", source: "company" },
+    ];
+    expect(await e.prefill({ ...prefill, fill, overwrite: "unedited" }, values, "number", prov)).toEqual(own);
+    // "unedited" is the default for trigger: "change", "always" for a button.
+    expect(await e.prefill({ ...prefill, fill, trigger: "change" }, values, "number", prov)).toEqual(own);
+    expect(await e.prefill({ ...prefill, fill }, values, "number", prov)).toHaveLength(5);
+    expect(await e.prefill({ ...prefill, fill, trigger: "change", overwrite: "always" }, values, "number", prov)).toHaveLength(5);
+  });
+
+  it("does nothing while a param is empty, and fetches fresh data on every call", async () => {
+    const { e, loader } = make();
+    expect(await e.prefill(prefill, { number: "" }, "number")).toEqual([]);
+    expect(loader).not.toHaveBeenCalled();
+    await e.prefill(prefill, { number: "1" }, "number");
+    await e.prefill(prefill, { number: "1" }, "number");
+    expect(loader).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects when the loader fails", async () => {
+    const { e } = make(vi.fn(async () => Promise.reject(new Error("404"))));
+    await expect(e.prefill(prefill, { number: "1" }, "number")).rejects.toThrow("404");
+  });
+});
+
+describe("disabled fields", () => {
+  it("are not validated or submitted", () => {
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: { lock: { type: "boolean" }, code: { type: "string", minLength: 3, "x-disabled": { logic: { var: "lock" } } } },
+        required: ["code"],
+      },
+    });
+    expect(e.validate({ lock: false }).fields.code).toBe("This field is required");
+    expect(e.validate({ lock: true })).toMatchObject({ valid: true, data: { lock: true } });
+    expect(e.validate({ lock: true, code: "x" })).toMatchObject({ valid: true, data: { lock: true } });
+  });
+});
+
+describe("stale values", () => {
+  it("lists values of inactive branches, unmet ifs and x-hidden or x-disabled fields", async () => {
+    const { schema, createLoaders } = await import("../src/demo/schema");
+    const e = new FormEngine({ schema, loaders: createLoaders(0) });
+    const values = {
+      applicant: { kind: "individual", firstName: "Ada", companyName: "old branch" },
+      hasPreviousClaims: true,
+      claims: [{ type: "fire", description: "hidden for fire" }],
+      marketingConsent: false,
+      marketingChannel: "sms",
+      promoCode: "disabled when there are claims",
+    };
+    expect(e.staleValues(values).sort()).toEqual(["applicant.companyName", "claims[0].description", "marketingChannel", "promoCode"]);
+    expect(e.staleValues({ hasPreviousClaims: false, claims: [] })).toEqual(["claims"]);
+  });
+
+  it("leaves values under a fragment that is still loading", async () => {
+    let release!: () => void;
+    const e = new FormEngine({
+      schema: { type: "object", properties: { d: { type: "object", "x-extend": { source: "f" } } } },
+      loaders: { f: () => new Promise((r) => (release = () => r({ properties: { keep: { type: "string" } } }))) },
+    });
+    const values = { d: { keep: "x", drop: "y" } };
+    expect(e.staleValues(values)).toEqual([]);
+    release();
+    await flush();
+    expect(e.staleValues(values)).toEqual(["d.drop"]);
   });
 });
 
@@ -476,5 +743,175 @@ describe("defaults", () => {
     const e = new FormEngine({ schema });
     (e.defaults() as any).o.a = 2;
     expect(schema.properties.o.default.a).toBe(1);
+  });
+});
+
+describe("computed fields", () => {
+  const schema: Schema = {
+    type: "object",
+    properties: {
+      qty: { type: "integer" },
+      price: { type: "number" },
+      total: { type: "number", readOnly: true, "x-compute": { logic: { "*": [{ var: "qty" }, { var: "price" }] } } },
+      // Editable: suggested from `total`, but the user's own value sticks.
+      budget: { type: "number", "x-compute": { logic: { "*": [{ var: "total" }, 2] } } },
+      lines: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            n: { type: "integer" },
+            double: { type: "integer", readOnly: true, "x-compute": { logic: { "*": [{ var: "$item.n" }, 2] } } },
+          },
+        },
+      },
+    },
+  };
+  const e = new FormEngine({ schema });
+
+  it("writes derived values, chains settle in one call, and nothing changes once settled", () => {
+    const r = e.applyComputed({ qty: 2, price: 5, lines: [{ n: 3 }] });
+    expect(r.values).toEqual({ qty: 2, price: 5, total: 10, budget: 20, lines: [{ n: 3, double: 6 }] });
+    expect(r.provenance).toEqual({ total: "compute", budget: "compute", "lines[0].double": "compute" });
+    expect(e.applyComputed(r.values, r.provenance).patches).toEqual([]);
+  });
+
+  it("evaluates every compute against the incoming values in a single pass", () => {
+    // budget reads the incoming (missing) total, so it is only filled on the next pass.
+    expect(e.computed({ qty: 2, price: 5 })).toEqual([{ path: "total", value: 10, source: "compute" }]);
+    expect(e.computed({ qty: 2, price: 5, total: 10 })).toEqual([{ path: "budget", value: 20, source: "compute" }]);
+  });
+
+  it("keeps a user's value in an editable computed field, but follows readOnly ones", () => {
+    const r = e.applyComputed({ qty: 2, price: 5, total: 1, budget: 999 }, { total: "compute" });
+    expect(r.values).toMatchObject({ total: 10, budget: 999 });
+    expect(r.provenance).toEqual({ total: "compute" });
+  });
+
+  it("refills an editable field it owns, and forgets it when the result is empty", () => {
+    const r = e.applyComputed({ qty: 2, price: 5, budget: 5 }, { budget: "compute" });
+    expect(r.values).toMatchObject({ budget: 20 });
+    const gone = e.applyComputed({ budget: 20 }, { budget: "compute" });
+    expect(gone.values).toEqual({});
+    expect(gone.provenance).toEqual({});
+  });
+
+  it("skips hidden and disabled fields", () => {
+    const withTotal = (extra: object) =>
+      new FormEngine({ schema: { ...schema, properties: { ...schema.properties, total: { ...schema.properties.total, ...extra } } } });
+    for (const h of [withTotal({ "x-hidden": { logic: true } }), withTotal({ "x-disabled": { logic: true } })])
+      expect(h.computed({ qty: 2, price: 5, total: 1 })).toEqual([{ path: "budget", value: 2, source: "compute" }]);
+  });
+
+  it("rejects computes that chase each other", () => {
+    const loop = new FormEngine({
+      schema: {
+        properties: {
+          a: { readOnly: true, "x-compute": { logic: { "+": [{ var: "b" }, 1] } } },
+          b: { readOnly: true, "x-compute": { logic: { "+": [{ var: "a" }, 1] } } },
+        },
+      },
+    });
+    expect(() => loop.applyComputed({ a: 0 })).toThrow(/never settles: a, b/);
+  });
+
+  it("can take its value from a loader, idle while params are empty", async () => {
+    const loader = vi.fn(async (p: Record<string, unknown>) => ({ fee: Number(p.plan) * 10 }));
+    const a = new FormEngine({
+      schema: {
+        properties: {
+          plan: { type: "string" },
+          fee: { type: "number", readOnly: true, "x-compute": { source: "fees", params: { plan: { var: "plan" } }, select: "fee" } },
+        },
+      },
+      loaders: { fees: loader },
+    });
+    expect(a.computed({ plan: "", fee: 1 })).toEqual([{ path: "fee", value: undefined, source: undefined }]);
+    expect(a.computed({ plan: "3" })).toEqual([]); // loading: no write yet
+    await flush();
+    expect(a.computed({ plan: "3" })).toEqual([{ path: "fee", value: 30, source: "compute" }]);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+
+  it("validate recomputes readOnly values the client sent, and leaves editable ones as sent", () => {
+    const r = e.validate({ qty: 2, price: 5, total: 999, budget: 1, lines: [{ n: 3, double: 0 }, { n: 4 }] });
+    expect(r.valid).toBe(true);
+    expect(r.data).toEqual({ qty: 2, price: 5, total: 10, budget: 1, lines: [{ n: 3, double: 6 }, { n: 4, double: 8 }] });
+    // An editable compute is a suggestion: an empty one stays empty on the server.
+    expect(e.validate({ qty: 2, price: 5 }).data).toEqual({ qty: 2, price: 5, total: 10 });
+  });
+
+  it("validates the recomputed value, not the one sent", () => {
+    const capped = new FormEngine({
+      schema: {
+        properties: {
+          qty: { type: "integer" },
+          total: { type: "number", maximum: 10, readOnly: true, "x-compute": { logic: { "*": [{ var: "qty" }, 3] } } },
+        },
+      },
+    });
+    expect(capped.validate({ qty: 5, total: 1 })).toMatchObject({ valid: false, fields: { total: "Must be <= 10" } });
+    expect(capped.validate({ qty: 3, total: 999 })).toMatchObject({ valid: true, data: { qty: 3, total: 9 } });
+  });
+
+  it("blocks validation until a readOnly compute's loader answers", async () => {
+    const a = new FormEngine({
+      schema: {
+        properties: {
+          plan: { type: "string" },
+          fee: { type: "number", readOnly: true, "x-compute": { source: "fees", params: { plan: { var: "plan" } }, select: "fee" } },
+        },
+      },
+      loaders: { fees: async (p) => ({ fee: Number(p.plan) * 10 }) },
+    });
+    expect(a.validate({ plan: "3", fee: 1 })).toMatchObject({ valid: false, form: "Some fields are still loading…" });
+    await flush();
+    expect(a.validate({ plan: "3", fee: 1 })).toMatchObject({ valid: true, data: { plan: "3", fee: 30 } });
+  });
+
+  it("validate ignores readOnly computes on disabled fields", () => {
+    const d = new FormEngine({
+      schema: {
+        properties: {
+          lock: { type: "boolean" },
+          t: { type: "number", readOnly: true, "x-disabled": { logic: { var: "lock" } }, "x-compute": { logic: 1 } },
+        },
+      },
+    });
+    expect(d.validate({ lock: true, t: 5 }).data).toEqual({ lock: true });
+    expect(d.validate({}).data).toEqual({ t: 1 });
+  });
+});
+
+describe("provenance helpers", () => {
+  it("updates immutably and returns the same object when nothing changes", () => {
+    const p = { a: "compute" };
+    expect(withSource(p, "a", "compute")).toBe(p);
+    expect(withSource(p, "a", undefined)).toEqual({});
+    expect(withoutPath({ "x.y": "l", "x[0]": "l", xy: "l" }, "x")).toEqual({ xy: "l" });
+    expect(withoutIndex({ "r[0].a": "l", "r[1].a": "l", "r[2].a": "l", "r[2].b": "l" }, "r", 1)).toEqual({ "r[0].a": "l", "r[1].a": "l", "r[1].b": "l" });
+    expect(pruneProvenance({ a: "l", b: "l" }, { a: 1 })).toEqual({ a: "l" });
+  });
+});
+
+describe("non-strict options", () => {
+  const e = new FormEngine({
+    schema: {
+      properties: {
+        strict: { type: "string", "x-options": { source: "list" } },
+        loose: { type: "string", maxLength: 3, "x-options": { source: "list", strict: false } },
+      },
+    },
+    loaders: { list: async () => [{ value: "a", label: "A" }] },
+  });
+
+  it("does not enforce or wait for the list, only the field's own keywords", async () => {
+    // Still loading: strict blocks, loose doesn't.
+    expect(e.validate({ loose: "zz" }).valid).toBe(true);
+    expect(e.validate({ strict: "zz" }).form).toMatch(/still loading/);
+    await flush();
+    expect(e.validate({ strict: "zz" }).fields).toEqual({ strict: "Please choose one of the options" });
+    expect(e.validate({ loose: "zz" }).valid).toBe(true);
+    expect(e.validate({ loose: "zzzz" }).fields).toEqual({ loose: "Must NOT have more than 3 characters" });
   });
 });

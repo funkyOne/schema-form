@@ -1,5 +1,5 @@
-import type { ComponentType } from "react";
-import type { AsyncEntry, ControlElement, Option, Schema } from "../engine";
+import type { ComponentType, ReactNode } from "react";
+import { primaryType, type AsyncEntry, type ControlElement, type Option, type Schema } from "../engine";
 
 /** Everything a leaf control needs. Swap these components for your design system. */
 export interface ControlProps {
@@ -34,10 +34,28 @@ export const humanize = (s: string) => {
   return words.charAt(0).toUpperCase() + words.slice(1);
 };
 
-const typeOf = (s: Schema) => (Array.isArray(s.type) ? s.type.find((t: string) => t !== "null") : s.type);
-const isChoice = (s: Schema) => Array.isArray(s.enum) || !!s["x-options"];
+/** Rendered as a pick list: a static enum or options loaded from the API. */
+export const isChoice = (s: Schema) => Array.isArray(s.enum) || !!s["x-options"];
 
 // ---------------------------------------------------------------- chrome shared by all controls
+
+export function ErrorText({ errors, id }: { errors: string[]; id?: string }) {
+  if (!errors.length) return null;
+  return (
+    <p className="sf-error" id={id} role="alert">
+      {errors[0]}
+    </p>
+  );
+}
+
+const Label = ({ label, required }: { label: string; required: boolean }) => (
+  <>
+    {label}
+    {required && <span className="sf-required" aria-hidden> *</span>}
+  </>
+);
+
+const fieldClass = (base: string, errors: string[]) => `${base}${errors.length ? " sf-field--invalid" : ""}`;
 
 export function FieldShell({
   id,
@@ -48,35 +66,47 @@ export function FieldShell({
   children,
   inline,
 }: Pick<ControlProps, "id" | "label" | "required" | "description" | "errors"> & {
-  children: React.ReactNode;
+  children: ReactNode;
   inline?: boolean;
 }) {
   return (
-    <div className={`sf-field${inline ? " sf-field--inline" : ""}${errors.length ? " sf-field--invalid" : ""}`}>
+    <div className={fieldClass(inline ? "sf-field sf-field--inline" : "sf-field", errors)}>
       {inline ? (
         <label htmlFor={id} className="sf-inline-label">
           {children}
           <span>
-            {label}
-            {required && <span className="sf-required" aria-hidden> *</span>}
+            <Label label={label} required={required} />
           </span>
         </label>
       ) : (
         <>
           <label htmlFor={id}>
-            {label}
-            {required && <span className="sf-required" aria-hidden> *</span>}
+            <Label label={label} required={required} />
           </label>
           {children}
         </>
       )}
       {description && <p className="sf-help">{description}</p>}
-      {errors.length > 0 && (
-        <p className="sf-error" id={`${id}-error`} role="alert">
-          {errors[0]}
-        </p>
-      )}
+      <ErrorText errors={errors} id={`${id}-error`} />
     </div>
+  );
+}
+
+/** A fieldset of radios or checkboxes, one per choice. */
+function ChoiceGroup({ p, children }: { p: ControlProps; children: (choice: Option, i: number) => ReactNode }) {
+  return (
+    <fieldset className={fieldClass("sf-field sf-radios", p.errors)} id={p.id} aria-invalid={p.errors.length > 0 || undefined}>
+      <legend>
+        <Label label={p.label} required={p.required} />
+      </legend>
+      {(p.choices ?? []).map((c, i) => (
+        <label key={String(c.value)} className="sf-inline-label">
+          {children(c, i)}
+          <span>{c.label}</span>
+        </label>
+      ))}
+      <ErrorText errors={p.errors} />
+    </fieldset>
   );
 }
 
@@ -90,43 +120,27 @@ const aria = (p: ControlProps) => ({
   onBlur: p.onBlur,
 });
 
-const emptyToUndefined = (v: string) => (v === "" ? undefined : v);
-
 // ---------------------------------------------------------------- default controls
 
-export function TextControl(p: ControlProps) {
-  const type = p.schema.format === "email" ? "email" : p.schema.format === "uri" ? "url" : "text";
-  return (
-    <FieldShell {...p}>
-      <input
-        {...aria(p)}
-        type={type}
-        value={(p.value as string) ?? ""}
-        placeholder={p.options.placeholder}
-        onChange={(e) => p.onChange(emptyToUndefined(e.target.value))}
-      />
-    </FieldShell>
-  );
+/** Shared by the text, textarea and date controls: strings, with "" stored as undefined. */
+function StringInput({ p, type, multiline }: { p: ControlProps; type?: string; multiline?: boolean }) {
+  const input = {
+    ...aria(p),
+    value: (p.value as string) ?? "",
+    placeholder: p.options.placeholder,
+    onChange: (e: { target: { value: string } }) => p.onChange(e.target.value === "" ? undefined : e.target.value),
+  };
+  return <FieldShell {...p}>{multiline ? <textarea {...input} rows={3} /> : <input {...input} type={type} />}</FieldShell>;
 }
 
-export function TextareaControl(p: ControlProps) {
-  return (
-    <FieldShell {...p}>
-      <textarea {...aria(p)} rows={3} value={(p.value as string) ?? ""} onChange={(e) => p.onChange(emptyToUndefined(e.target.value))} />
-    </FieldShell>
-  );
-}
-
-export function DateControl(p: ControlProps) {
-  return (
-    <FieldShell {...p}>
-      <input {...aria(p)} type="date" value={(p.value as string) ?? ""} onChange={(e) => p.onChange(emptyToUndefined(e.target.value))} />
-    </FieldShell>
-  );
-}
+export const TextControl = (p: ControlProps) => (
+  <StringInput p={p} type={p.schema.format === "email" ? "email" : p.schema.format === "uri" ? "url" : "text"} />
+);
+export const TextareaControl = (p: ControlProps) => <StringInput p={p} multiline />;
+export const DateControl = (p: ControlProps) => <StringInput p={p} type="date" />;
 
 export function NumberControl(p: ControlProps) {
-  const integer = typeOf(p.schema) === "integer";
+  const integer = primaryType(p.schema) === "integer";
   return (
     <FieldShell {...p}>
       <input
@@ -156,18 +170,18 @@ export function CheckboxControl(p: ControlProps) {
   );
 }
 
+const SELECT_PLACEHOLDER = { idle: "Choose the previous field first", loading: "Loading…", error: "Couldn't load options" };
+
 export function SelectControl(p: ControlProps) {
   const st = p.choicesState;
   const choices = p.choices ?? [];
   const placeholder =
-    st?.status === "idle"
-      ? p.options.placeholder ?? "Choose the previous field first"
-      : st?.status === "loading"
-        ? "Loading…"
-        : st?.status === "error"
-          ? "Couldn't load options"
-          : p.options.placeholder ?? "Select…";
+    st?.status === "loading" || st?.status === "error"
+      ? SELECT_PLACEHOLDER[st.status]
+      : (p.options.placeholder ?? (st?.status === "idle" ? SELECT_PLACEHOLDER.idle : "Select…"));
   const index = choices.findIndex((c) => c.value === p.value);
+  // A value outside the list (non-strict x-options, or still loading) stays visible as itself.
+  const foreign = p.value !== undefined && p.value !== null && index < 0;
   return (
     <FieldShell {...p}>
       <div className="sf-select-row">
@@ -175,10 +189,14 @@ export function SelectControl(p: ControlProps) {
           {...aria(p)}
           disabled={p.disabled || (st !== undefined && st.status !== "success")}
           aria-busy={st?.status === "loading" || undefined}
-          value={index >= 0 ? String(index) : ""}
-          onChange={(e) => p.onChange(e.target.value === "" ? undefined : choices[Number(e.target.value)]!.value)}
+          value={index >= 0 ? String(index) : foreign ? "current" : ""}
+          onChange={(e) => {
+            const v = e.target.value;
+            p.onChange(v === "" ? undefined : v === "current" ? p.value : choices[Number(v)]!.value);
+          }}
         >
           <option value="">{placeholder}</option>
+          {foreign && <option value="current">{String(p.value)}</option>}
           {choices.map((c, i) => (
             <option key={String(c.value)} value={String(i)}>
               {c.label}
@@ -197,75 +215,61 @@ export function SelectControl(p: ControlProps) {
 
 export function RadioControl(p: ControlProps) {
   return (
-    <fieldset className={`sf-field sf-radios${p.errors.length ? " sf-field--invalid" : ""}`} id={p.id} aria-invalid={p.errors.length > 0 || undefined}>
-      <legend>
-        {p.label}
-        {p.required && <span className="sf-required" aria-hidden> *</span>}
-      </legend>
-      {(p.choices ?? []).map((c, i) => (
-        <label key={String(c.value)} className="sf-inline-label">
-          <input
-            type="radio"
-            name={p.path}
-            id={i === 0 ? `${p.id}-0` : undefined}
-            disabled={p.disabled}
-            checked={p.value === c.value}
-            onChange={() => p.onChange(c.value)}
-            onBlur={p.onBlur}
-          />
-          <span>{c.label}</span>
-        </label>
-      ))}
-      {p.errors.length > 0 && (
-        <p className="sf-error" role="alert">
-          {p.errors[0]}
-        </p>
+    <ChoiceGroup p={p}>
+      {(c, i) => (
+        <input
+          type="radio"
+          name={p.path}
+          id={i === 0 ? `${p.id}-0` : undefined}
+          disabled={p.disabled}
+          checked={p.value === c.value}
+          onChange={() => p.onChange(c.value)}
+          onBlur={p.onBlur}
+        />
       )}
-    </fieldset>
+    </ChoiceGroup>
   );
 }
 
 /** Array of enum values, e.g. { type: "array", items: { enum: [...] }, uniqueItems: true } */
 export function MultiCheckboxControl(p: ControlProps) {
   const selected = Array.isArray(p.value) ? p.value : [];
-  const toggle = (v: unknown, on: boolean) =>
-    p.onChange(on ? [...selected, v] : selected.filter((x) => x !== v));
   return (
-    <fieldset className={`sf-field sf-radios${p.errors.length ? " sf-field--invalid" : ""}`} id={p.id}>
-      <legend>{p.label}</legend>
-      {(p.choices ?? []).map((c) => (
-        <label key={String(c.value)} className="sf-inline-label">
-          <input type="checkbox" disabled={p.disabled} checked={selected.includes(c.value)} onChange={(e) => toggle(c.value, e.target.checked)} />
-          <span>{c.label}</span>
-        </label>
-      ))}
-      {p.errors.length > 0 && <p className="sf-error" role="alert">{p.errors[0]}</p>}
-    </fieldset>
+    <ChoiceGroup p={p}>
+      {(c) => (
+        <input
+          type="checkbox"
+          disabled={p.disabled}
+          checked={selected.includes(c.value)}
+          onChange={(e) => p.onChange(e.target.checked ? [...selected, c.value] : selected.filter((x) => x !== c.value))}
+        />
+      )}
+    </ChoiceGroup>
   );
 }
 
+const typeIs = (s: Schema, ...types: string[]) => types.includes(primaryType(s) ?? "");
+
 export const defaultRenderers: RendererEntry[] = [
   { name: "text", rank: () => 1, component: TextControl },
-  { name: "textarea", rank: (s, o) => (o.multi && typeOf(s) === "string" ? 6 : -1), component: TextareaControl },
+  { name: "textarea", rank: (s, o) => (o.multi && typeIs(s, "string") ? 6 : -1), component: TextareaControl },
   { name: "date", rank: (s) => (s.format === "date" ? 5 : -1), component: DateControl },
-  { name: "number", rank: (s) => (["number", "integer"].includes(typeOf(s)) && !isChoice(s) ? 5 : -1), component: NumberControl },
-  { name: "checkbox", rank: (s) => (typeOf(s) === "boolean" ? 5 : -1), component: CheckboxControl },
+  { name: "number", rank: (s) => (typeIs(s, "number", "integer") && !isChoice(s) ? 5 : -1), component: NumberControl },
+  { name: "checkbox", rank: (s) => (typeIs(s, "boolean") ? 5 : -1), component: CheckboxControl },
   { name: "select", rank: (s) => (isChoice(s) ? 10 : -1), component: SelectControl },
   // Few static choices read better as radios.
   { name: "radio", rank: (s) => (Array.isArray(s.enum) && s.enum.length <= 3 && s["x-enumLabels"] ? 11 : -1), component: RadioControl },
-  { name: "multicheckbox", rank: (s) => (typeOf(s) === "array" && isChoice(s.items ?? {}) ? 10 : -1), component: MultiCheckboxControl },
+  { name: "multicheckbox", rank: (s) => (typeIs(s, "array") && isChoice(s.items ?? {}) ? 10 : -1), component: MultiCheckboxControl },
 ];
 
 export function pickRenderer(renderers: RendererEntry[], schema: Schema, options: ControlProps["options"]) {
-  if (options.widget) {
-    const forced = renderers.find((r) => r.name === options.widget);
-    if (forced) return forced.component;
-  }
-  let best: RendererEntry | undefined;
+  const forced = options.widget && renderers.find((r) => r.name === options.widget);
+  if (forced) return forced.component;
+  let best = defaultRenderers[0]!;
   let bestRank = -1;
   for (const r of renderers) {
     const rank = r.rank(schema, options);
     if (rank > bestRank) (best = r), (bestRank = rank);
   }
-  return (best ?? defaultRenderers[0]!).component;
+  return best.component;
 }
