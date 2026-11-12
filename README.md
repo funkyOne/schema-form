@@ -32,7 +32,7 @@ See [IDEA.md](IDEA.md) for the principles and decisions and [USE-CASES.md](USE-C
 ## Install
 
 ```sh
-npm install @oleg-nd/schema-form
+npm install @funkyone/schema-form
 ```
 
 React 18 or newer is a peer dependency.
@@ -40,8 +40,8 @@ React 18 or newer is a peer dependency.
 ## Usage
 
 ```tsx
-import { SchemaForm } from "@oleg-nd/schema-form";
-import "@oleg-nd/schema-form/styles.css";
+import { SchemaForm } from "@funkyone/schema-form";
+import "@funkyone/schema-form/styles.css";
 
 const schema = {
   type: "object",
@@ -119,7 +119,7 @@ The snapshot holds the values, the provenance map and any branch picks. Old draf
 The engine has no React dependency:
 
 ```ts
-import { FormEngine, toStandardSchema } from "@oleg-nd/schema-form/engine";
+import { FormEngine, toStandardSchema } from "@funkyone/schema-form/engine";
 
 const engine = new FormEngine({ schema, uischema, loaders: serverLoaders });
 const { valid, fields, form, data } = engine.validate(body);

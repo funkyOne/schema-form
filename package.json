@@ -1,15 +1,15 @@
 {
-  "name": "@oleg-nd/schema-form",
+  "name": "@funkyone/schema-form",
   "version": "0.1.0",
   "description": "Schema-driven forms for React: JSON Schema + JSON Logic in, TanStack Form and Query underneath, a framework-free engine that also runs on the server.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/oleg-nd/schema-form.git"
+    "url": "git+https://github.com/funkyOne/schema-form.git"
   },
-  "homepage": "https://github.com/oleg-nd/schema-form#readme",
+  "homepage": "https://github.com/funkyOne/schema-form#readme",
   "bugs": {
-    "url": "https://github.com/oleg-nd/schema-form/issues"
+    "url": "https://github.com/funkyOne/schema-form/issues"
   },
   "keywords": [
     "json-schema",
