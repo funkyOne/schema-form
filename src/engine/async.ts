@@ -15,6 +15,10 @@ export class Notifier {
   private disconnect?: () => void;
   constructor(private connect?: (notify: () => void) => () => void) {}
   get = () => this.version;
+  /** While someone listens, every change to our queries bumps the version. */
+  get listening() {
+    return this.listeners.size > 0;
+  }
   subscribe = (fn: () => void) => {
     if (!this.listeners.size) this.disconnect = this.connect?.(() => this.notify());
     this.listeners.add(fn);
@@ -32,8 +36,10 @@ export class Notifier {
 }
 
 /** A param that is empty means "not ready": nothing is fetched. */
-export const isIncomplete = (params: Record<string, unknown>) =>
-  Object.values(params).some((v) => v === undefined || v === null || v === "");
+export const isIncomplete = (params: Record<string, unknown>) => Object.values(params).some(isBlank);
+
+/** No value: undefined, null or "". An empty param means "not ready"; an empty field skips its rules. */
+export const isBlank = (v: unknown) => v === undefined || v === null || v === "";
 
 const IDLE: AsyncEntry = Object.freeze({ status: "idle" });
 const LOADING: AsyncEntry = Object.freeze({ status: "loading" });

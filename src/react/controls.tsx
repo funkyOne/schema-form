@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { primaryType, type AsyncEntry, type ControlElement, type Option, type Schema } from "../engine";
+import { primaryType, type AsyncEntry, type ControlElement, type CustomElement, type Option, type Schema, type UIElement } from "../engine";
 
 /** Everything a leaf control needs. Swap these components for your design system. */
 export interface ControlProps {
@@ -20,6 +20,29 @@ export interface ControlProps {
   choices?: Option[];
   /** Load state of x-options; undefined for static enums. */
   choicesState?: AsyncEntry<Option[]>;
+  /** Data loaded for the field's `x-data` refs, by name (e.g. rows for a table control). */
+  data: Record<string, AsyncEntry>;
+}
+
+/** One section of a custom layout (e.g. a step) that has at least one active field. */
+export interface LayoutSection {
+  el: UIElement;
+  /** The section's `label`, when it has one. */
+  label?: string;
+  /** Data paths of its active fields; pass them to `errorsWithin` for a section's errors. */
+  fields: string[];
+  /** Render the section's content. */
+  render: () => ReactNode;
+}
+
+/**
+ * Props of a custom layout (`<SchemaForm layouts={{ Stepper }}>`). Sections whose fields are all
+ * hidden or inactive are left out. Layouts are display only: which section is open, and whether
+ * errors are shown on them, is the layout's own state.
+ */
+export interface LayoutProps {
+  el: CustomElement;
+  sections: LayoutSection[];
 }
 
 export interface RendererEntry {
@@ -262,8 +285,12 @@ export const defaultRenderers: RendererEntry[] = [
   { name: "multicheckbox", rank: (s) => (typeIs(s, "array") && isChoice(s.items ?? {}) ? 10 : -1), component: MultiCheckboxControl },
 ];
 
+/** The renderer registered under `name`, if any. */
+export const findRenderer = (renderers: RendererEntry[], name: string | undefined) =>
+  name ? renderers.find((r) => r.name === name) : undefined;
+
 export function pickRenderer(renderers: RendererEntry[], schema: Schema, options: ControlProps["options"]) {
-  const forced = options.widget && renderers.find((r) => r.name === options.widget);
+  const forced = findRenderer(renderers, options.widget);
   if (forced) return forced.component;
   let best = defaultRenderers[0]!;
   let bestRank = -1;

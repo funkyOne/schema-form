@@ -2,18 +2,22 @@ import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
 import addFormats from "ajv-formats";
 import type { QueryClient } from "@tanstack/query-core";
 import jsonLogic from "json-logic-js";
-import { AsyncCache, createQueryClient, isIncomplete, Notifier, watchQueries } from "./async";
+import { AsyncCache, createQueryClient, isBlank, isIncomplete, Notifier, watchQueries } from "./async";
 import { deepEqual, getIn, isWithin, joinPath, parsePath, parsePointer, formatPath, resolveRelativePath, setIn } from "./path";
 import { withPatches } from "./provenance";
 import { deref, idOf, Memo, merge, normalize, primaryType, without } from "./schema-ops";
 import {
   COMPUTE_SOURCE,
   USER_SOURCE,
+  isControl,
   type AsyncEntry,
   type AsyncSourceRef,
   type Combinator,
   type Compute,
   type Condition,
+  type DataLogic,
+  type Rule,
+  type UIElement,
   type Loaders,
   type Prefill,
   type Option,
@@ -35,13 +39,35 @@ export interface EngineOptions {
   strict?: boolean;
 }
 
-const STRIP_FOR_VALIDATION = ["properties", "items", "required", "x-options", "x-enumLabels", "x-extend", "x-compute", "x-hidden", "x-disabled", "x-prefill", "$schema"];
+/**
+ * A node's own keywords for Ajv: children are rebuilt by `concretize`, and our `x-` keywords mean
+ * nothing to Ajv. `x-messages` stays: error messages are looked up on the failing schema.
+ */
+function forValidation(s: Schema): Schema {
+  const drop = Object.keys(s).filter(
+    (k) => (k.startsWith("x-") && k !== "x-messages") || k === "properties" || k === "items" || k === "required" || k === "$schema",
+  );
+  return without(s, ...drop);
+}
+
+/** Load state of a condition's or rule's `source`, when it isn't ready yet. */
+type Waiting = "loading" | "error";
+const RULE_LOAD_FAILED = "Couldn't check this value. Please try again.";
+
 
 /** Passes `applyComputed` makes before concluding the computes chase each other. */
 const MAX_COMPUTE_PASSES = 10;
 const SKIP = Symbol("skip");
+const NOT_HELD = Object.freeze({ holds: false });
 
-type Flat = { schema: Schema; combinator?: Combinator; nullable: boolean; extend?: AsyncEntry };
+type Flat = {
+  schema: Schema;
+  combinator?: Combinator;
+  nullable: boolean;
+  extend?: AsyncEntry;
+  /** Child keys whose `x-hidden` reads a source that is still loading or failed. */
+  waiting?: Record<string, Waiting>;
+};
 
 export class FormEngine {
   readonly root: Schema;
@@ -60,6 +86,8 @@ export class FormEngine {
   /** Concrete schemas interned by content, so equal structures share one compiled validator. */
   private concreteMemo = new Memo<Schema>();
   private messages?: EngineOptions["messages"];
+  /** Last concretize / check result, reused while the values and the loaded data are unchanged. */
+  private lastResults: Partial<Record<"concrete" | "check", { values: unknown; version: number; result: unknown }>> = {};
 
   constructor(opts: EngineOptions) {
     this.root = opts.schema;
@@ -109,8 +137,8 @@ export class FormEngine {
   }
 
   /** Load `ref` for the field at `path`; `missing` stands in for a `select`ed part that isn't there. */
-  readAsync(ref: AsyncSourceRef, values: unknown, path: string, missing?: unknown): AsyncEntry {
-    const entry = this.cache.read(ref.source, this.params(ref, values, path));
+  readAsync(ref: AsyncSourceRef, values: unknown, path: string, missing?: unknown, scope?: Record<string, unknown>): AsyncEntry {
+    const entry = this.cache.read(ref.source, this.params(ref, values, path, scope));
     if (!ref.select || entry.status !== "success") return entry;
     // Same object while the response is unchanged, so fields reading a slice don't re-render.
     const select = ref.select;
@@ -121,11 +149,25 @@ export class FormEngine {
   }
 
   /** Evaluate a ref's JSON Logic params for the field at `path`. */
-  params(ref: AsyncSourceRef, values: unknown, path: string): Record<string, unknown> {
-    const scope = this.scope(values, path);
+  params(ref: AsyncSourceRef, values: unknown, path: string, scope = this.scope(values, path)): Record<string, unknown> {
     const params: Record<string, unknown> = {};
     for (const [k, expr] of Object.entries(ref.params ?? {})) params[k] = jsonLogic.apply(expr as any, scope);
     return params;
+  }
+
+  /**
+   * Evaluate JSON Logic at the field `self`, with the response of its `source` (if any) as `$data`.
+   * `waiting` is set while that source is loading or failed.
+   */
+  evalLogic(d: DataLogic, values: unknown, self: string): { result: unknown; waiting?: Waiting } {
+    const scope = this.scope(values, self);
+    let waiting: Waiting | undefined;
+    if (d.source) {
+      const entry = this.readAsync(d as AsyncSourceRef, values, self, undefined, scope);
+      if (entry.status === "loading" || entry.status === "error") waiting = entry.status;
+      scope.$data = entry.status === "success" ? entry.data : undefined;
+    }
+    return { result: jsonLogic.apply(d.logic as any, scope), waiting };
   }
 
   /**
@@ -271,6 +313,7 @@ export class FormEngine {
       c ? `${c.kind}:${idOf(c.branches)}:${c.selected}:${c.discriminator ?? ""}` : "",
       flat.nullable ? "n" : "",
       flat.extend ? `${flat.extend.status}:${idOf(flat.extend)}` : "",
+      flat.waiting ? JSON.stringify(flat.waiting) : "",
     ].join("|");
     return this.resolvedMemo.get(key, () => ({ ...flat }));
   }
@@ -281,11 +324,13 @@ export class FormEngine {
     let combinator: Combinator | undefined;
     let nullable = false;
     let extend: AsyncEntry | undefined;
+    let waiting: Record<string, Waiting> | undefined;
     const take = (r: Flat, strip: string[] = []) => {
       s = merge(s, strip.length ? without(r.schema, ...strip) : r.schema);
       combinator ??= r.combinator;
       nullable ||= r.nullable;
       extend ??= r.extend;
+      if (r.waiting) waiting = { ...waiting, ...r.waiting };
     };
 
     if (Array.isArray(s.allOf)) {
@@ -364,30 +409,54 @@ export class FormEngine {
       if (entry.status === "success") take(this.flatten(entry.data, path, values), ["title"]);
     }
 
-    if (s.properties) s = this.withoutHidden(s, path, values);
-    return { schema: s, combinator, nullable, extend };
+    if (s.properties) {
+      // Hidden properties vanish here (and in nested flattens), so whether a condition is still
+      // waiting for its source has to travel with the result for validation to see it.
+      const own = this.withoutHidden(s, path, values);
+      s = own.schema;
+      if (own.waiting) waiting = { ...waiting, ...own.waiting };
+    }
+    return { schema: s, combinator, nullable, extend, waiting };
   }
 
   /**
-   * Drop properties whose `x-hidden` holds, as if they sat under an unmet `if`.
-   * Only the property's own schema (after $ref) is checked, so recursive schemas stay finite.
+   * Drop properties whose `x-hidden` holds, as if they sat under an unmet `if`, and note the ones
+   * whose condition is still waiting for its source. Only the property's own schema (after $ref)
+   * is checked, so recursive schemas stay finite.
    */
-  private withoutHidden(s: Schema, path: string, values: unknown): Schema {
-    const hidden = Object.keys(s.properties).filter((k) => this.holds(s.properties[k], "x-hidden", path, k, values));
-    if (!hidden.length) return s;
-    return this.derivedMemo.get(`hide:${idOf(s)}:${JSON.stringify(hidden)}`, () => {
+  private withoutHidden(s: Schema, path: string, values: unknown): { schema: Schema; waiting?: Record<string, Waiting> } {
+    const hidden: string[] = [];
+    let waiting: Record<string, Waiting> | undefined;
+    for (const k of Object.keys(s.properties)) {
+      const c = this.condition(s.properties[k], "x-hidden", path, k, values);
+      if (c.holds) hidden.push(k);
+      if (c.waiting) (waiting ??= {})[k] = c.waiting;
+    }
+    if (!hidden.length) return { schema: s, waiting };
+    const schema = this.derivedMemo.get(`hide:${idOf(s)}:${JSON.stringify(hidden)}`, () => {
       const properties = { ...s.properties };
       for (const k of hidden) delete properties[k];
       const out: Schema = { ...s, properties };
       if (Array.isArray(s.required)) out.required = s.required.filter((k: string) => !hidden.includes(k));
       return out;
     });
+    return { schema, waiting };
   }
 
-  /** Does the `keyword` condition on child `key` of the object at `parent` hold? */
-  private holds(node: unknown, keyword: "x-hidden" | "x-disabled", parent: string, key: string | number, values: unknown) {
+  /** Does the `keyword` condition on child `key` of the object at `parent` hold, and is it waiting for data? */
+  private condition(
+    node: unknown,
+    keyword: "x-hidden" | "x-disabled",
+    parent: string,
+    key: string | number,
+    values: unknown,
+  ): { holds: boolean; waiting?: Waiting } {
     const cond = deref(this.root, node)[keyword] as Condition | undefined;
-    return cond !== undefined && this.evalCondition(cond, parent, values, joinPath(parent, key));
+    if (cond === undefined) return NOT_HELD;
+    const self = joinPath(parent, key);
+    if (!("logic" in cond)) return { holds: this.evalCondition(cond, parent, values, self) };
+    const { result, waiting } = this.evalLogic(cond, values, self);
+    return { holds: !!result, waiting };
   }
 
   /** The (unresolved) schema node at `path`, or undefined if that field is not active right now. */
@@ -431,6 +500,14 @@ export class FormEngine {
     this.notifier.notify();
   }
 
+  /** Load a node's `x-data` refs by name, for its control. Undefined when it has none. */
+  readData(schema: Schema, path: string, values: unknown): Record<string, AsyncEntry> | undefined {
+    const refs = schema["x-data"] as Record<string, AsyncSourceRef> | undefined;
+    if (!refs) return undefined;
+    const scope = this.scope(values, path);
+    return Object.fromEntries(Object.entries(refs).map(([k, ref]) => [k, this.readAsync(ref, values, path, undefined, scope)]));
+  }
+
   readOptions(schema: Schema, path: string, values: unknown): AsyncEntry<Option[]> | undefined {
     const ref = schema["x-options"] as AsyncSourceRef | undefined;
     return ref ? (this.readAsync(ref, values, path, []) as AsyncEntry<Option[]>) : undefined;
@@ -443,7 +520,7 @@ export class FormEngine {
    * at `base`: JSON Logic sees $self/$parent/$item of the field; a `path` test is relative to `base`.
    */
   evalCondition(cond: Condition, base: string, values: unknown, self = base): boolean {
-    if ("logic" in cond) return !!jsonLogic.apply(cond.logic as any, this.scope(values, self));
+    if ("logic" in cond) return !!this.evalLogic(cond, values, self).result;
     return this.test(cond.schema, getIn(values, resolveRelativePath(cond.path, base)));
   }
 
@@ -454,7 +531,7 @@ export class FormEngine {
     for (const seg of parsePath(path)) {
       const { schema } = this.resolve(node, cur, values);
       const next = typeof seg === "number" ? schema.items : schema.properties?.[seg];
-      if (next === undefined || this.holds(next, "x-disabled", cur, seg, values)) return next !== undefined;
+      if (next === undefined || this.condition(next, "x-disabled", cur, seg, values).holds) return next !== undefined;
       node = next;
       cur = joinPath(cur, seg);
     }
@@ -467,24 +544,33 @@ export class FormEngine {
    * list: `x-hidden` removes them from the resolved schema.
    */
   disabledPaths(values: unknown): Set<string> {
-    const out = new Set<string>();
+    return this.scanDisabled(values).paths;
+  }
+
+  /** `disabledPaths`, plus the fields whose `x-disabled` is still waiting for its source. */
+  private scanDisabled(values: unknown): { paths: Set<string>; waiting: Record<string, Waiting> } {
+    const paths = new Set<string>();
+    const waiting: Record<string, Waiting> = {};
+    const check = (node: unknown, parent: string, key: string | number) => {
+      const c = this.condition(node, "x-disabled", parent, key, values);
+      if (c.waiting) waiting[joinPath(parent, key)] = c.waiting;
+      if (c.holds) paths.add(joinPath(parent, key));
+      return c.holds;
+    };
     const walk = (node: unknown, path: string) => {
       const s = this.resolve(node, path, values).schema;
       const value = getIn(values, path);
       for (const k of Object.keys(s.properties ?? {})) {
         const child = joinPath(path, k);
-        if (this.holds(s.properties[k], "x-disabled", path, k, values)) out.add(child);
-        else if (getIn(values, child) !== undefined) walk(s.properties[k], child);
+        if (!check(s.properties[k], path, k) && getIn(values, child) !== undefined) walk(s.properties[k], child);
       }
       if (s.items !== undefined && Array.isArray(value))
         value.forEach((_, i) => {
-          const child = joinPath(path, i);
-          if (this.holds(s.items, "x-disabled", path, i, values)) out.add(child);
-          else walk(s.items, child);
+          if (!check(s.items, path, i)) walk(s.items, joinPath(path, i));
         });
     };
     walk(this.root, "");
-    return out;
+    return { paths, waiting };
   }
 
   // ============================================================== validation
@@ -498,23 +584,30 @@ export class FormEngine {
    * Fields without a value are not walked into: nothing below them can fail (a missing
    * required field is reported by its parent), and this keeps recursive schemas finite.
    */
-  concretize(
-    values: unknown,
-    disabled = this.disabledPaths(values),
-  ): { schema: Schema; pending: string[]; failed: string[] } {
+  concretize(values: unknown): { schema: Schema; pending: string[]; failed: string[]; rules: Record<string, string> } {
+    return this.reuse("concrete", values, () => this.concretizeNow(values));
+  }
+
+  private concretizeNow(values: unknown): { schema: Schema; pending: string[]; failed: string[]; rules: Record<string, string> } {
     const pending: string[] = [];
     const failed: string[] = [];
+    const rules: Record<string, string> = {};
+    const wait = (path: string, w: Waiting) => (w === "loading" ? pending : failed).push(path);
+    const { paths: disabled, waiting: disabledWaiting } = this.scanDisabled(values);
+    for (const [path, w] of Object.entries(disabledWaiting)) wait(path, w);
     // `optionsPath` is where x-options params are evaluated: for a multi-select's items that
     // is the array itself, matching what the UI loads.
     const walk = (node: unknown, path: string, optionsPath = path): Schema => {
       const r = this.resolve(node, path, values);
       const s = r.schema;
       const value = getIn(values, path);
-      const out: Schema = { ...without(s, ...STRIP_FOR_VALIDATION) };
+      const out: Schema = { ...forValidation(s) };
       if (value === undefined && path) return out;
 
       if (r.extend?.status === "loading") pending.push(path);
       if (r.extend?.status === "error") failed.push(path);
+      for (const [k, w] of Object.entries(r.waiting ?? {})) wait(joinPath(path, k), w);
+      if (path && !isBlank(value)) this.checkRules(s, path, values, rules, pending);
       if (s.properties) {
         const visible = Object.keys(s.properties).filter((k) => !disabled.has(joinPath(path, k)));
         out.properties = Object.fromEntries(visible.map((k) => [k, walk(s.properties[k], joinPath(path, k))]));
@@ -523,7 +616,8 @@ export class FormEngine {
       }
       if (s.items !== undefined) {
         // One concrete schema per item, since conditions can differ between items.
-        if (Array.isArray(value)) {
+        // An empty list has no items to check (and Ajv rejects `items: []`).
+        if (Array.isArray(value) && value.length) {
           out.items = value.map((_, i) => walk(s.items, joinPath(path, i), path));
           out.additionalItems = false;
         }
@@ -539,7 +633,60 @@ export class FormEngine {
     };
 
     const schema = walk(this.root, "");
-    return { schema: this.concreteMemo.get(JSON.stringify(schema), () => schema), pending, failed };
+    return { schema: this.concreteMemo.get(JSON.stringify(schema), () => schema), pending, failed, rules };
+  }
+
+  /** Run the `x-validate` rules of the field at `path`; the first failing one reports. */
+  private checkRules(s: Schema, path: string, values: unknown, out: Record<string, string>, pending: string[]) {
+    const list = s["x-validate"] as Rule[] | Rule | undefined;
+    for (const rule of [list ?? []].flat()) {
+      const { result, waiting } = this.evalLogic(rule, values, path);
+      if (waiting === "loading") pending.push(path);
+      else if (waiting === "error") out[path] ??= RULE_LOAD_FAILED;
+      else if (!result) out[path] ??= rule.message;
+    }
+  }
+
+  /**
+   * `x-validate` failures by field path, for showing live while the user types (before any submit).
+   * Rules still waiting for their source report nothing yet. Reused while values and async data
+   * are unchanged, so every field can read it cheaply.
+   */
+  ruleErrors(values: unknown): Record<string, string> {
+    return this.check(values).rules;
+  }
+
+  /**
+   * Reuse the last `slot` result while `values` is the same object and no loaded data changed.
+   * The notifier counts data changes only while someone listens (a mounted form); without
+   * listeners (server, tests) nothing is reused, which is always correct.
+   */
+  private reuse<T>(slot: "concrete" | "check", values: unknown, compute: () => T): T {
+    if (!this.notifier.listening) return compute();
+    // Read before computing: a fetch the computation starts bumps the version and expires this entry.
+    const version = this.notifier.get();
+    const last = this.lastResults[slot];
+    if (last && last.values === values && last.version === version) return last.result as T;
+    const result = compute();
+    this.lastResults[slot] = { values, version, result };
+    return result;
+  }
+
+  /**
+   * Data paths of the active fields a layout element shows, relative paths resolved against
+   * `base`. Empty when every field in it is hidden or inactive, so a step, tab or group with
+   * nothing to show can be skipped.
+   */
+  fieldsOf(el: UIElement, base: string, values: unknown): string[] {
+    if (!isControl(el)) return el.elements.flatMap((child) => this.fieldsOf(child, base, values));
+    const path = resolveRelativePath(el.path, base);
+    return this.schemaAt(path, values) === undefined ? [] : [path];
+  }
+
+  /** Does a layout element show at least one active field? (`fieldsOf`, stopping at the first.) */
+  hasActiveField(el: UIElement, base: string, values: unknown): boolean {
+    if (!isControl(el)) return el.elements.some((child) => this.hasActiveField(child, base, values));
+    return this.schemaAt(resolveRelativePath(el.path, base), values) !== undefined;
   }
 
   /**
@@ -562,9 +709,18 @@ export class FormEngine {
    * computes and prefills are assistive and left as sent.
    */
   validate(values: unknown): ValidationResult & { data: unknown } {
-    const derived = this.withDerived(values);
-    values = derived.values;
-    const { schema, pending, failed } = this.concretize(values);
+    return this.check(values).result;
+  }
+
+  /** Validation plus the rule failures on their own, so live rule errors match what submit sees. */
+  private check(values: unknown): { result: ValidationResult & { data: unknown }; rules: Record<string, string> } {
+    return this.reuse("check", values, () => this.checkNow(values));
+  }
+
+  private checkNow(input: unknown): { result: ValidationResult & { data: unknown }; rules: Record<string, string> } {
+    const derived = this.withDerived(input);
+    const values = derived.values;
+    const { schema, pending, failed, rules } = this.concretize(values);
     const data = prune(values, schema);
     const fn = this.compile(schema);
     const ok = fn(data) as boolean;
@@ -578,9 +734,12 @@ export class FormEngine {
       if (!name) form ??= msg;
       else fields[name] ??= msg;
     }
+    for (const [path, msg] of Object.entries(rules)) fields[path] ??= msg;
+    const rulesOk = !Object.keys(rules).length;
     if (failed.length) form ??= "Part of this form failed to load. Please retry.";
     if (pending.length || derived.waiting.length) form ??= "Some fields are still loading…";
-    return { valid: ok && !pending.length && !failed.length && !derived.waiting.length, fields, form, data };
+    const valid = ok && rulesOk && !pending.length && !failed.length && !derived.waiting.length;
+    return { result: { valid, fields, form, data }, rules };
   }
 
   private messageFor(e: ErrorObject): string {

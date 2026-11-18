@@ -132,9 +132,35 @@ export type AsyncEntry<T = unknown> =
  * x-disabled: while true the field (and everything under it) is shown locked, is not validated
  *   or submitted, and its value is cleared.
  */
-export type Condition =
-  | { logic: JsonLogic }
-  | { path: string; schema: Schema };
+export type Condition = DataLogic | { path: string; schema: Schema };
+
+/**
+ * JSON Logic evaluated at a field's own path ($self, $parent, $item), optionally over loaded data:
+ * with `source` (+ `params`, `select`, as in AsyncSourceRef) the response is available as `$data`.
+ *   { "source": "downstream", "params": { ... }, "logic": { "!": { "var": "$data.selectable.length" } } }
+ * While the source is loading or failed, `$data` is undefined and validation waits (reports it
+ * as still loading / failed to load), so a condition never lets data through unchecked.
+ */
+export interface DataLogic {
+  logic: JsonLogic;
+  source?: string;
+  params?: Record<string, JsonLogic>;
+  select?: string;
+}
+
+/**
+ * A custom validation rule, declared on the field it reports on:
+ *   "x-validate": [{ "logic": { "!=": [{ "var": "$self" }, { "var": "$parent.mnemonic" }] },
+ *                    "message": "Description cannot be the same as Mnemonic" }]
+ * `logic` must hold (be truthy) for the value to be valid. Rules run only on fields that are
+ * active and hold a value (`required` covers empty ones). With `source`, the logic sees the
+ * loaded response as `$data` (e.g. "a search for this code returns something").
+ * Rules are part of `validate`, so they run on the server too; the form shows their errors
+ * live, without waiting for a submit.
+ */
+export interface Rule extends DataLogic {
+  message: string;
+}
 
 // ---------------------------------------------------------------- UI schema (layout only)
 
@@ -142,6 +168,8 @@ export type Condition =
 
 export interface LayoutElement {
   type: "VerticalLayout" | "HorizontalLayout";
+  /** Not shown by the built-in layouts; available to a custom layout holding this one (e.g. a step title). */
+  label?: string;
   elements: UIElement[];
 }
 
@@ -168,7 +196,26 @@ export interface ControlElement {
   };
 }
 
-export type UIElement = LayoutElement | GroupElement | ControlElement;
+/**
+ * A layout type the host renders itself (a stepper, tabs, an accordion), registered through
+ * `<SchemaForm layouts={{ Stepper: MyStepper }}>`. Its `elements` are its sections (e.g. steps).
+ * Purely presentational: it never gates validation.
+ */
+export interface CustomElement {
+  type: string;
+  label?: string;
+  elements: UIElement[];
+  options?: Record<string, unknown>;
+}
+
+export type UIElement = LayoutElement | GroupElement | ControlElement | CustomElement;
+
+const BUILT_IN_TYPES: ReadonlySet<string> = new Set(["Control", "VerticalLayout", "HorizontalLayout", "Group"]);
+
+export const isControl = (el: UIElement): el is ControlElement => el.type === "Control";
+
+/** A layout type the host registers in `layouts` rather than one of the built-in types. */
+export const isCustomLayout = (el: UIElement): el is CustomElement => !BUILT_IN_TYPES.has(el.type);
 
 // ---------------------------------------------------------------- resolution
 
@@ -190,6 +237,8 @@ export interface Resolved {
   nullable: boolean;
   /** Status of an `x-extend` on this node, if any. */
   extend?: AsyncEntry;
+  /** Child keys whose `x-hidden` reads a source that is still loading or failed. */
+  waiting?: Record<string, "loading" | "error">;
 }
 
 /** Errors by field path plus an optional form-level message: what validation produces and what a server may return. */

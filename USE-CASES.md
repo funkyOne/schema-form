@@ -104,5 +104,23 @@ Assistive only: the server doesn't run it, it validates whatever values result.
 **How:** `onSubmit` returns `{ fields, form }`, the same shape the engine's `validate` produces (so a server running the engine can return its result as-is). Errors show inline and in the summary, the first invalid control is focused, and each clears when its field is next validated (on edit, after a submit attempt).
 **Status:** Supported (test: form-features › server errors)
 
-## Out of scope: steps / stepper
-A multi-step layout is a display concern of the host app. The UI schema's layouts plus `x-hidden` give it what it needs; there is no per-step validation in the engine.
+## 18. Cross-field validation
+**Need:** Account Description must not equal Account Mnemonic; the error shows on `description` as the user types.
+**How:** on the field it reports on: `"x-validate": [{ "logic": { "!=": [{ "var": "$self" }, { "var": "$parent.mnemonic" }] }, "message": "Account Description cannot be the same as Account Mnemonic" }]`. A rule's logic must hold; it is skipped while the field is empty, hidden or disabled. Rules are part of `validate` (so the server runs them too and they block submit) and the form shows their errors live once the field was edited, re-evaluated on every change, so editing the other field clears the error.
+**Status:** Supported (tests: form-scenarios › 18; engine-features › x-validate rules)
+
+## 19. Errors from a remote check, shown before submit
+**Need:** a GOC code with no search results is marked "Invalid GOC" right away. AMC validation runs when the user reaches Review, and its errors show inline on their fields until fixed.
+**How:** a rule over loaded data: `"x-validate": [{ "source": "gocSearch", "params": { "q": { "var": "$self" } }, "logic": { "!!": { "var": "$data.length" } }, "message": "Invalid GOC. Please enter a valid GOC" }]` (shares the request with a typeahead using the same source and params; submit waits while it loads). Hierarchy fields fill through `x-prefill` with `trigger: "change"`.
+For checks the host runs itself (AMC), pass `externalErrors={{ amc: { fields: { foRiskSystem: "…" } } }}`: shown inline at once, kept until the host replaces or removes that entry (i.e. the next run), and they block submit. `useSchemaForm().validateLocal()` tells the host whether local rules pass, so it can skip AMC and clear its old errors when they don't. Mapping AMC's entities to field paths is the host's job.
+**Status:** Supported (tests: form-scenarios › 19A, 19B; engine-features › x-validate rules › waits for a rule's source)
+
+## 20. Custom control for an array of objects
+**Need:** downstream systems are a table of `{ systemName, csiId }` rows with checkboxes, not an add/remove list.
+**How:** `"x-widget": "downstreamTable"` on the array (or `options.widget` in the UI schema) renders it with that renderer as one field holding the whole array. `"x-data": { "selectable": { "source": "downstream", "select": "selectable" }, "automated": { … "select": "automated" } }` loads the rows (one request) and passes them to the control as `data`. Which rows are ticked, their order and keeping draft-only entries is the control's own logic.
+**Status:** Supported (test: form-scenarios › 20)
+
+## 21. Multi-step form with a Review step
+**Need:** a stepper (the client's design-system component) with one step per group of fields, error badges per step after Review is visited, and Review listing the steps with errors.
+**How:** a custom UI schema type, `{ "type": "Stepper", "elements": [{ "type": "Group", "label": "Classification", … }, …] }`, rendered by the component passed in `layouts={{ Stepper }}`. It receives `sections` (label, active field paths, `render()`); steps whose fields are all hidden are left out. Steps are display only and never gate validation: the stepper keeps "Review visited" itself and computes badges with `errorsWithin(useFormErrors({ all: true }), section.fields)`, which update as fields are fixed. A step can hide on service data with `"x-hidden": { "source": "downstream", "select": "selectable", "logic": { "!": { "var": "$data.length" } } }`.
+**Status:** Supported (tests: form-scenarios › 21; engine-features › conditions over loaded data, fieldsOf)

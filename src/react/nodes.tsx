@@ -1,24 +1,38 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
+  deepEqual,
+  isControl,
+  isCustomLayout,
   isIncomplete,
   joinPath,
   parsePath,
   primaryType,
   resolveRelativePath,
+  type AsyncEntry,
   type ControlElement,
-  type FormEngine,
+  type CustomElement,
   type Prefill,
   type Option,
   type Resolved,
   type Schema,
   type UIElement,
 } from "../engine";
-import { applyPatches, BaseProvider, forgetIndex, markManual, shallowArrayEqual, useBase, useFormSelector, useSchemaForm } from "./context";
-import { ErrorText, humanize, isChoice, pickRenderer, type ControlProps } from "./controls";
+import {
+  applyPatches,
+  BaseProvider,
+  forgetIndex,
+  markManual,
+  shallowRecordEqual,
+  useBase,
+  useFieldErrors,
+  useFormSelector,
+  useSchemaForm,
+} from "./context";
+import { ErrorText, findRenderer, humanize, isChoice, pickRenderer, type ControlProps, type LayoutSection } from "./controls";
 
 type Options = NonNullable<ControlElement["options"]>;
 const NO_OPTIONS: Options = {};
-const NO_ERRORS: string[] = [];
+const NO_DATA: Record<string, AsyncEntry> = {};
 
 const lastSegment = (path: string) => {
   const segs = parsePath(path);
@@ -27,30 +41,20 @@ const lastSegment = (path: string) => {
 };
 const idFor = (path: string) => "sf-" + (path || "root").replace(/[^a-zA-Z0-9_-]+/g, "-");
 
-/** Errors set directly on a path (e.g. object/array-level errors like minItems). */
-function usePathErrors(path: string): string[] {
-  return useFormSelector(
-    (s) => (s.fieldMeta?.[path]?.errors as string[] | undefined) ?? NO_ERRORS,
-    shallowArrayEqual,
-  );
-}
-
 // ================================================================= UI schema elements
-
-/** Does this layout show at least one field that is part of the active schema? */
-function hasActiveControl(engine: FormEngine, el: UIElement, base: string, values: unknown): boolean {
-  if (el.type === "Control") return engine.schemaAt(resolveRelativePath(el.path, base), values) !== undefined;
-  return el.elements.some((child) => hasActiveControl(engine, child, base, values));
-}
 
 /** Layout only: visibility and locking come from the schema (x-hidden / x-disabled). */
 export function UIElementView({ el }: { el: UIElement }) {
-  const { engine } = useSchemaForm();
+  const { engine, layouts } = useSchemaForm();
   const { base } = useBase();
   // A group whose fields are all hidden or inactive disappears with them.
-  const visible = useFormSelector((s) => el.type === "Control" || hasActiveControl(engine, el, base, s.values));
+  const visible = useFormSelector((s) => isControl(el) || engine.hasActiveField(el, base, s.values));
   if (!visible) return null;
-  if (el.type === "Control") return <ControlView el={el} />;
+  if (isControl(el)) return <ControlView el={el} />;
+  if (isCustomLayout(el)) {
+    if (!layouts[el.type]) throw new Error(`No layout registered for UI schema type "${el.type}" (pass it in \`layouts\`)`);
+    return <CustomLayoutView el={el} />;
+  }
   const children = el.elements.map((child, i) => <UIElementView key={i} el={child} />);
   if (el.type === "Group")
     return (
@@ -60,6 +64,24 @@ export function UIElementView({ el }: { el: UIElement }) {
       </fieldset>
     );
   return <div className={el.type === "HorizontalLayout" ? "sf-row" : "sf-col"}>{children}</div>;
+}
+
+/** Hands a custom layout its sections that still have something to show. */
+function CustomLayoutView({ el }: { el: CustomElement }) {
+  const { engine, layouts } = useSchemaForm();
+  const { base } = useBase();
+  const fields = useFormSelector((s) => el.elements.map((child) => engine.fieldsOf(child, base, s.values)), deepEqual);
+  const sections = useMemo(
+    () =>
+      el.elements.flatMap((child, i): LayoutSection[] =>
+        fields[i]!.length
+          ? [{ el: child, label: child.label, fields: fields[i]!, render: () => <UIElementView el={child} /> }]
+          : [],
+      ),
+    [el, fields],
+  );
+  const Layout = layouts[el.type]!;
+  return <Layout el={el} sections={sections} />;
 }
 
 function ControlView({ el }: { el: ControlElement }) {
@@ -102,11 +124,24 @@ function ResolvedNode({ schema, path, label, options = NO_OPTIONS, required = fa
   const s = resolved.schema;
   const title = label ?? s.title ?? humanize(lastSegment(path));
   const type = primaryType(s);
+  // A widget named in the UI schema or by `x-widget` renders the node as one field, objects
+  // and arrays included (e.g. a table of checkboxes instead of the add/remove list).
+  const widget: string | undefined = options.widget ?? s["x-widget"];
+  const opts = useMemo(() => (widget && !options.widget ? { ...options, widget } : options), [options, widget]);
+  const { renderers } = useSchemaForm();
 
   const switcher =
     resolved.combinator && !resolved.combinator.discriminator ? (
       <BranchSwitch path={path} resolved={resolved} label={title} />
     ) : null;
+
+  if ((type === "object" || type === "array") && findRenderer(renderers, widget))
+    return (
+      <>
+        {switcher}
+        <FieldNode schema={s} nullable={resolved.nullable} path={path} label={title} options={opts} required={required} />
+      </>
+    );
 
   if (type === "object" && !isChoice(s))
     return <ObjectNode resolved={resolved} path={path} label={title} options={options} switcher={switcher} />;
@@ -123,7 +158,7 @@ function ResolvedNode({ schema, path, label, options = NO_OPTIONS, required = fa
         nullable={resolved.nullable}
         path={path}
         label={title}
-        options={options}
+        options={opts}
         required={required}
       />
     </>
@@ -144,7 +179,7 @@ function ObjectNode({
   switcher: ReactNode;
 }) {
   const s = resolved.schema;
-  const errors = usePathErrors(path);
+  const errors = useFieldErrors(path);
   const required: string[] = s.required ?? [];
 
   const content = options.detail ? (
@@ -214,11 +249,11 @@ function ArrayNode({ resolved, path, label, options }: { resolved: Resolved; pat
   const { disabled } = useBase();
   const items = resolved.schema.items;
   const s = resolved.schema;
+  const errors = useFieldErrors(path);
   return (
     <form.Field name={path} mode="array">
       {(field: any) => {
         const list: unknown[] = Array.isArray(field.state.value) ? field.state.value : [];
-        const errors: string[] = field.state.meta.errors ?? [];
         const canAdd = !disabled && (s.maxItems === undefined || list.length < s.maxItems);
         return (
           <fieldset className={`sf-array${errors.length ? " sf-field--invalid" : ""}`} id={idFor(path)}>
@@ -291,6 +326,8 @@ function FieldNode({
   const { disabled } = useBase();
   const choiceSchema: Schema = primaryType(schema) === "array" ? schema.items : schema;
   const choicesState = useFormSelector((s) => engine.readOptions(choiceSchema, path, s.values));
+  const data = useFormSelector((s) => engine.readData(schema, path, s.values) ?? NO_DATA, shallowRecordEqual);
+  const errors = useFieldErrors(path);
   const Component = pickRenderer(renderers, schema, options);
 
   let choices: Option[] | undefined;
@@ -320,10 +357,11 @@ function FieldNode({
               field.handleChange(v === undefined && nullable ? null : v);
             }}
             onBlur={field.handleBlur}
-            errors={field.state.meta.errors ?? NO_ERRORS}
+            errors={errors}
             options={options}
             choices={choices}
             choicesState={choicesState}
+            data={data}
           />
           {schema["x-prefill"] && <PrefillView prefill={schema["x-prefill"]} path={path} disabled={disabled} />}
         </>

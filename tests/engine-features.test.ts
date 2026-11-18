@@ -915,3 +915,161 @@ describe("non-strict options", () => {
     expect(e.validate({ loose: "zzzz" }).fields).toEqual({ loose: "Must NOT have more than 3 characters" });
   });
 });
+
+describe("x-validate rules", () => {
+  const notSame = {
+    logic: { "!=": [{ var: "$self" }, { var: "$parent.mnemonic" }] },
+    message: "Account Description cannot be the same as Account Mnemonic",
+  };
+  const schema: Schema = {
+    type: "object",
+    properties: {
+      mnemonic: { type: "string" },
+      description: { type: "string", "x-validate": [notSame] },
+      locked: { type: "boolean" },
+      note: { type: "string", "x-validate": { logic: false, message: "never" }, "x-disabled": { logic: { var: "locked" } } },
+      extra: { type: "string", "x-validate": [{ logic: false, message: "never" }], "x-hidden": { logic: true } },
+      lines: {
+        type: "array",
+        items: { type: "object", properties: { from: { type: "number" }, to: { type: "number", "x-validate": [{ logic: { ">": [{ var: "$self" }, { var: "$parent.from" }] }, message: "Must be after from" }] } } },
+      },
+    },
+  };
+
+  it("reports a failing rule on its field until the other field changes, in validate too", () => {
+    const e = new FormEngine({ schema });
+    expect(e.ruleErrors({ mnemonic: "GOCTEST2", description: "GOCTEST2" })).toEqual({ description: notSame.message });
+    const r = e.validate({ mnemonic: "GOCTEST2", description: "GOCTEST2" });
+    expect(r).toMatchObject({ valid: false, fields: { description: notSame.message } });
+    expect(e.validate({ mnemonic: "GOCTEST3", description: "GOCTEST2" }).valid).toBe(true);
+  });
+
+  it("skips empty, disabled and hidden fields, and evaluates per array item", () => {
+    const e = new FormEngine({ schema });
+    expect(e.ruleErrors({ mnemonic: "A", description: "" })).toEqual({});
+    expect(e.validate({ locked: true, note: "x", extra: "x" }).valid).toBe(true);
+    expect(e.ruleErrors({ note: "x" })).toEqual({ note: "never" });
+    expect(e.ruleErrors({ lines: [{ from: 1, to: 2 }, { from: 5, to: 3 }] })).toEqual({ "lines[1].to": "Must be after from" });
+  });
+
+  it("waits for a rule's source, checks its $data, and reports a failed load on the field", async () => {
+    const gocSearch = vi.fn(async ({ q }: any) => {
+      if (q === "BOOM") throw new Error("down");
+      return q === "GOC1" ? [{ code: "GOC1" }] : [];
+    });
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          goc: {
+            type: "string",
+            "x-validate": [{ source: "gocSearch", params: { q: { var: "$self" } }, logic: { "!!": { var: "$data.length" } }, message: "Invalid GOC" }],
+          },
+        },
+      },
+      loaders: { gocSearch },
+    });
+    expect(e.validate({ goc: "BADGOC" })).toMatchObject({ valid: false, fields: {}, form: "Some fields are still loading…" });
+    await flush();
+    expect(e.validate({ goc: "BADGOC" }).fields).toEqual({ goc: "Invalid GOC" });
+    e.validate({ goc: "GOC1" });
+    await flush();
+    expect(e.validate({ goc: "GOC1" }).valid).toBe(true);
+    e.validate({ goc: "BOOM" });
+    await flush();
+    expect(e.ruleErrors({ goc: "BOOM" }).goc).toMatch(/Couldn't check/);
+    expect(gocSearch).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("conditions over loaded data", () => {
+  const make = (rows: unknown[]) =>
+    new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          systems: {
+            type: "array",
+            items: { type: "string" },
+            minItems: 1,
+            "x-hidden": { source: "downstream", select: "selectable", logic: { "!": { var: "$data.length" } } },
+          },
+        },
+        required: ["systems"],
+      },
+      loaders: { downstream: async () => ({ selectable: rows }) },
+    });
+
+  it("hides while the source loads, keeping the value and holding validation, then follows the data", async () => {
+    const empty = make([]);
+    expect(props(empty, "", {})).toEqual(["name"]);
+    expect(empty.validate({}).valid).toBe(false);
+    expect(empty.staleValues({ systems: ["a"] })).toEqual([]);
+    await flush();
+    expect(empty.validate({}).valid).toBe(true);
+    expect(empty.staleValues({ systems: ["a"] })).toEqual(["systems"]);
+
+    const some = make(["Risk Engine"]);
+    some.validate({});
+    await flush();
+    expect(props(some, "", {})).toEqual(["name", "systems"]);
+    expect(some.validate({}).fields).toEqual({ systems: "This field is required" });
+  });
+});
+
+describe("fieldsOf", () => {
+  it("lists the active fields a layout element shows, resolving relative paths", () => {
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          a: { type: "string" },
+          b: { type: "string", "x-hidden": { logic: { "!": { var: "a" } } } },
+          o: { type: "object", properties: { c: { type: "string" } } },
+        },
+      },
+    });
+    const step = {
+      type: "Step",
+      elements: [
+        { type: "Control", path: "a" },
+        { type: "VerticalLayout", elements: [{ type: "Control", path: "b" }] },
+        { type: "Control", path: "c" },
+      ],
+    } as const;
+    expect(e.fieldsOf(step as any, "", {})).toEqual(["a"]);
+    expect(e.fieldsOf(step as any, "", { a: "x" })).toEqual(["a", "b"]);
+    expect(e.fieldsOf({ type: "Control", path: "c" }, "o", {})).toEqual(["o.c"]);
+  });
+});
+
+describe("empty arrays", () => {
+  it("validate an empty list of objects (no per-item schema to build)", () => {
+    const e = new FormEngine({
+      schema: { type: "object", properties: { pets: { type: "array", minItems: 1, items: { type: "object", properties: { name: { type: "string" } } } } } },
+    });
+    expect(e.validate({ pets: [] })).toMatchObject({ valid: false, fields: { pets: "Must NOT have fewer than 1 items" } });
+  });
+});
+
+describe("x-disabled over loaded data on array items", () => {
+  it("holds validation while the item condition's source loads", async () => {
+    const e = new FormEngine({
+      schema: {
+        type: "object",
+        properties: {
+          rows: {
+            type: "array",
+            items: { type: "string", minLength: 3, "x-disabled": { source: "locks", logic: { var: "$data.locked" } } },
+          },
+        },
+      },
+      loaders: { locks: async () => ({ locked: true }) },
+    });
+    expect(e.validate({ rows: ["abcd"] })).toMatchObject({ valid: false, form: "Some fields are still loading…" });
+    await flush();
+    expect(e.validate({ rows: ["abcd"] }).valid).toBe(true);
+    expect([...e.disabledPaths({ rows: ["abcd"] })]).toEqual(["rows[0]"]);
+  });
+});

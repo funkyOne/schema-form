@@ -1,7 +1,7 @@
 import { revalidateLogic, useForm } from "@tanstack/react-form";
 import type { QueryClient } from "@tanstack/query-core";
 import { Store } from "@tanstack/store";
-import { useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore, type ComponentType, type ReactNode } from "react";
 import {
   FormEngine,
   noProvenance,
@@ -13,8 +13,19 @@ import {
   type Schema,
   type UIElement,
 } from "../engine";
-import { applyPatches, forgetPath, FormContext, useFormSelector, useSchemaForm, type SchemaFormApi } from "./context";
-import { defaultRenderers, type RendererEntry } from "./controls";
+import {
+  applyPatches,
+  forgetPath,
+  FormContext,
+  flattenExternal,
+  shallowRecordEqual,
+  useFormErrors,
+  useFormSelector,
+  useSchemaForm,
+  type ExternalErrors,
+  type SchemaFormApi,
+} from "./context";
+import { defaultRenderers, type LayoutProps, type RendererEntry } from "./controls";
 import { SchemaNode, UIElementView } from "./nodes";
 
 export interface SchemaFormProps<TData = unknown> {
@@ -44,7 +55,19 @@ export interface SchemaFormProps<TData = unknown> {
   renderActions?: (form: SchemaFormApi) => ReactNode;
   /** Pass a pre-built engine to share it with server-side or test code. */
   engine?: FormEngine;
+  /**
+   * Errors from checks the host runs itself (a remote validation when the user reaches Review),
+   * by check name: `{ amc: { fields: { "classification.foRiskSystem": "…" } } }`.
+   * Shown inline right away and kept until you replace or remove that check's entry;
+   * while any are present, submit is blocked.
+   */
+  externalErrors?: ExternalErrors;
+  /** Custom UI schema layout types (a stepper, tabs) by `type` name. Display only. */
+  layouts?: Record<string, ComponentType<LayoutProps>>;
 }
+
+const NO_LAYOUTS: Record<string, ComponentType<LayoutProps>> = {};
+const NO_EXTERNAL: ExternalErrors = {};
 
 function mergeDefaults(defaults: unknown, initial: unknown): unknown {
   if (initial === undefined) return defaults;
@@ -72,6 +95,11 @@ export function SchemaForm<TData = unknown>(props: SchemaFormProps<TData>) {
     return [...custom, ...defaultRenderers.filter((d) => !custom.some((c) => c.name === d.name))];
   }, [props.renderers]);
 
+  const external = useMemo(() => new Store<ExternalErrors>(props.externalErrors ?? NO_EXTERNAL), []);
+  useLayoutEffect(() => {
+    external.setState(() => props.externalErrors ?? NO_EXTERNAL);
+  }, [external, props.externalErrors]);
+
   const onSubmitRef = useRef(props.onSubmit);
   onSubmitRef.current = props.onSubmit;
   const domRef = useRef<HTMLFormElement>(null);
@@ -92,9 +120,12 @@ export function SchemaForm<TData = unknown>(props: SchemaFormProps<TData>) {
     // Validate on submit, then on every change once the user has tried to submit.
     validationLogic: revalidateLogic(),
     validators: {
+      // Errors from host-run checks count like any other: they make the form invalid until cleared.
       onDynamic: ({ value }) => {
         const r = engine.validate(value);
-        return r.valid ? undefined : { form: r.form, fields: r.fields };
+        const ext = flattenExternal(external.state);
+        if (r.valid && !ext.form && !Object.keys(ext.fields).length) return undefined;
+        return { form: ext.form ?? r.form, fields: { ...r.fields, ...ext.fields } };
       },
     },
     onSubmit: async ({ value, formApi }) => {
@@ -120,7 +151,12 @@ export function SchemaForm<TData = unknown>(props: SchemaFormProps<TData>) {
     // Keep the values consistent with the schema after every change:
     // 1. write computed fields (settled, so chains land in one batch)
     // 2. clear values whose field disappeared (inactive branch, unmet `if`, x-hidden or x-disabled)
+    // Skipped when neither the values nor the loaded data changed (blur, meta and submit-state updates).
+    let last: { values: unknown; version: number } | undefined;
     const sync = () => {
+      const version = engine.notifier.get();
+      if (last && last.values === form.state.values && last.version === version) return;
+      last = { values: form.state.values, version };
       applyPatches(ctx, engine.applyComputed(form.state.values, provenance.state).patches);
       for (const path of engine.staleValues(form.state.values)) {
         form.setFieldValue(path, undefined, { dontUpdateMeta: true });
@@ -131,17 +167,35 @@ export function SchemaForm<TData = unknown>(props: SchemaFormProps<TData>) {
     const a = form.store.subscribe(sync);
     // When async data lands (options, schema fragments) after a submit attempt, re-validate so
     // "still loading" errors clear and newly loaded fields are checked.
+    const revalidate = () => {
+      if (form.state.submissionAttempts > 0) void form.validate("change");
+    };
     const b = engine.notifier.subscribe(() => {
       sync();
-      if (form.state.submissionAttempts > 0) void form.validate("change");
+      revalidate();
     });
+    // New or cleared external errors after a submit attempt update the form's validity too.
+    const c = external.subscribe(revalidate);
     return () => {
       a.unsubscribe();
       b.unsubscribe();
+      c.unsubscribe();
     };
-  }, [engine, form, provenance]);
+  }, [engine, form, provenance, external]);
 
-  const ctx = useMemo(() => ({ form, engine, renderers, provenance }), [form, engine, renderers, provenance]);
+  const layouts = props.layouts ?? NO_LAYOUTS;
+  const ctx = useMemo(
+    () => ({
+      form,
+      engine,
+      renderers,
+      provenance,
+      external,
+      layouts,
+      validateLocal: () => engine.validate(form.state.values),
+    }),
+    [form, engine, renderers, provenance, external, layouts],
+  );
 
   return (
     <FormContext.Provider value={ctx}>
@@ -185,27 +239,14 @@ function StateListener({
   return null;
 }
 
-const shallowRecordEqual = (a: Record<string, unknown>, b: Record<string, unknown>) => {
-  const ka = Object.keys(a);
-  return ka.length === Object.keys(b).length && ka.every((k) => a[k] === b[k]);
-};
-
 function FormFooter({ label, renderActions }: { label: string; renderActions?: (form: SchemaFormApi) => ReactNode }) {
-  const formError = useFormSelector((s) => (s.errorMap?.onDynamic ?? s.errorMap?.onServer) as string | undefined);
-  const errorCount = useFormSelector(
-    (s) => Object.values(s.fieldMeta ?? {}).filter((m: any) => m?.errors?.length).length,
-  );
   const submitting = useFormSelector((s) => s.isSubmitting as boolean);
   const attempted = useFormSelector((s) => (s.submissionAttempts as number) > 0);
   const { form } = useSchemaForm();
 
   return (
     <div className="sf-footer">
-      {attempted && (formError || errorCount > 0) && (
-        <p className="sf-error sf-summary" role="alert">
-          {formError ?? `Please fix ${errorCount} ${errorCount === 1 ? "field" : "fields"} above.`}
-        </p>
-      )}
+      {attempted && <ErrorSummary />}
       {renderActions ? (
         renderActions(form)
       ) : (
@@ -214,6 +255,19 @@ function FormFooter({ label, renderActions }: { label: string; renderActions?: (
         </button>
       )}
     </div>
+  );
+}
+
+/** Shown after a submit attempt only, so the merged error stream isn't built before then. */
+function ErrorSummary() {
+  const errors = useFormErrors();
+  const formError = errors[""];
+  const count = Object.keys(errors).filter(Boolean).length;
+  if (!formError && !count) return null;
+  return (
+    <p className="sf-error sf-summary" role="alert">
+      {formError ?? `Please fix ${count} ${count === 1 ? "field" : "fields"} above.`}
+    </p>
   );
 }
 

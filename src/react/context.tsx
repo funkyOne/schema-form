@@ -1,8 +1,20 @@
 import { batch, type Store } from "@tanstack/store";
-import { createContext, useCallback, useContext, useMemo, useRef, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useMemo, useRef, type ComponentType, type ReactNode } from "react";
 import { useSyncExternalStoreWithSelector } from "use-sync-external-store/shim/with-selector";
-import { USER_SOURCE, withPatches, withSource, withoutIndex, withoutPath, type FormEngine, type Patch, type Provenance } from "../engine";
-import type { RendererEntry } from "./controls";
+import {
+  isWithin,
+  USER_SOURCE,
+  withPatches,
+  withSource,
+  withoutIndex,
+  withoutPath,
+  type FormEngine,
+  type FormErrors,
+  type Patch,
+  type Provenance,
+  type ValidationResult,
+} from "../engine";
+import type { LayoutProps, RendererEntry } from "./controls";
 
 /**
  * The TanStack form instance. Field names are built at runtime from the schema,
@@ -17,7 +29,20 @@ interface FormContextValue {
   renderers: RendererEntry[];
   /** Who last wrote each field (computes, prefills). Lives next to the values, saved in snapshots. */
   provenance: Store<Provenance>;
+  /** Errors from checks the host runs itself (`externalErrors` prop), by check name. */
+  external: Store<ExternalErrors>;
+  /** Custom layout types by name (`layouts` prop). */
+  layouts: Record<string, ComponentType<LayoutProps>>;
+  /**
+   * Validate the current values (schema, x-validate rules, loaded options) without submitting
+   * or showing anything: e.g. to decide whether to run a remote check when the user reaches Review.
+   * External errors are not included.
+   */
+  validateLocal: () => ValidationResult & { data: unknown };
 }
+
+/** Errors from host-run checks, by check name: `{ amc: { fields: { "a.b": "…" } } }`. */
+export type ExternalErrors = Record<string, FormErrors | undefined>;
 
 /** Write engine patches (computes, prefills, clearing) into the form and record their sources. */
 export function applyPatches(ctx: Pick<FormContextValue, "form" | "provenance">, patches: readonly Patch[]) {
@@ -77,38 +102,131 @@ export function BaseProvider({ base, disabled, children }: { base?: string; disa
 // ---------------------------------------------------------------- subscriptions
 
 type FormState = { values: unknown; [key: string]: any };
+interface Snapshot {
+  state: FormState;
+  version: number;
+  external: ExternalErrors;
+}
 
 /**
  * Subscribe to a derived value of the form state. Re-renders only when the
  * selected value changes. Also re-runs when async data arrives or a oneOf
  * branch is picked (engine.notifier), since those change what is resolved.
  */
-export function useFormSelector<T>(select: (state: FormState) => T, isEqual?: (a: T, b: T) => boolean): T {
-  const { form, engine } = useSchemaForm();
-  const snap = useRef<{ state: FormState; version: number } | null>(null);
+export function useFormSelector<T>(
+  select: (state: FormState, external: ExternalErrors) => T,
+  isEqual?: (a: T, b: T) => boolean,
+): T {
+  const { form, engine, external } = useSchemaForm();
+  const snap = useRef<Snapshot | null>(null);
 
   const subscribe = useCallback(
     (onChange: () => void) => {
       const a = form.store.subscribe(onChange);
       const b = engine.notifier.subscribe(onChange);
+      const c = external.subscribe(onChange);
       return () => {
         a.unsubscribe();
         b.unsubscribe();
+        c.unsubscribe();
       };
     },
-    [form, engine],
+    [form, engine, external],
   );
 
   const getSnapshot = useCallback(() => {
     const state = form.store.state as FormState;
     const version = engine.notifier.get();
+    const ext = external.state;
     const cur = snap.current;
-    if (cur && cur.state === state && cur.version === version) return cur;
-    return (snap.current = { state, version });
-  }, [form, engine]);
+    if (cur && cur.state === state && cur.version === version && cur.external === ext) return cur;
+    return (snap.current = { state, version, external: ext });
+  }, [form, engine, external]);
 
-  return useSyncExternalStoreWithSelector(subscribe, getSnapshot, getSnapshot, (s) => select(s.state), isEqual);
+  return useSyncExternalStoreWithSelector(subscribe, getSnapshot, getSnapshot, (s) => select(s.state, s.external), isEqual);
 }
+
+// ---------------------------------------------------------------- one error stream
+
+const NO_ERRORS: string[] = [];
+
+const flatMemo = new WeakMap<ExternalErrors, Required<FormErrors>>();
+
+/** All checks' errors as one `{ fields, form }`; the first check to name a path wins. */
+export function flattenExternal(external: ExternalErrors): FormErrors & { fields: Record<string, string> } {
+  let flat = flatMemo.get(external);
+  if (!flat) {
+    flat = { fields: {}, form: "" };
+    for (const e of Object.values(external)) {
+      for (const [p, m] of Object.entries(e?.fields ?? {})) if (m) flat.fields[p] ??= m;
+      if (e?.form && !flat.form) flat.form = e.form;
+    }
+    flatMemo.set(external, flat);
+  }
+  return { fields: flat.fields, form: flat.form || undefined };
+}
+
+/**
+ * Messages showing on `path` right now, most important first:
+ * external checks › server / schema errors (after a submit attempt) › live `x-validate` rules
+ * (once the field was edited, or after a submit attempt).
+ */
+function errorsAt(engine: FormEngine, state: FormState, external: ExternalErrors, path: string): string[] {
+  const meta = state.fieldMeta?.[path];
+  const out: string[] = [];
+  const add = (m: unknown) => typeof m === "string" && m && !out.includes(m) && out.push(m);
+  add(flattenExternal(external).fields[path]);
+  for (const m of meta?.errors ?? []) add(m);
+  if (meta?.isDirty || state.submissionAttempts > 0) add(engine.ruleErrors(state.values)[path]);
+  return out.length ? out : NO_ERRORS;
+}
+
+/** Messages showing on one field (or on an object / array as a whole). */
+export function useFieldErrors(path: string): string[] {
+  const { engine } = useSchemaForm();
+  return useFormSelector((s, ext) => errorsAt(engine, s, ext, path), shallowArrayEqual);
+}
+
+/**
+ * Every error by field path, merged into one stream: external checks, server errors, schema
+ * errors and `x-validate` rules.
+ * - default: what the fields show right now (schema errors only after a submit attempt).
+ * - `all: true`: everything that would block a submit, shown or not; e.g. for a stepper's
+ *   error badges once the user has reached Review.
+ * A form-level message (root error, still loading, failed load) is under the "" key.
+ */
+export function useFormErrors({ all = false }: { all?: boolean } = {}): Record<string, string> {
+  const { engine } = useSchemaForm();
+  return useFormSelector((s, ext) => {
+    const flat = flattenExternal(ext);
+    const out: Record<string, string> = { ...flat.fields };
+    let formError: unknown;
+    if (all) {
+      const r = engine.validate(s.values);
+      for (const [p, m] of Object.entries(r.fields)) out[p] ??= m;
+      formError = r.form;
+    } else {
+      for (const p of new Set([...Object.keys(s.fieldMeta ?? {}), ...Object.keys(engine.ruleErrors(s.values))])) {
+        const first = errorsAt(engine, s, ext, p)[0];
+        if (first) out[p] ??= first;
+      }
+      formError = s.errorMap?.onDynamic ?? s.errorMap?.onServer;
+    }
+    const form = flat.form ?? (typeof formError === "string" ? formError : undefined);
+    if (form) out[""] = form;
+    return out;
+  }, shallowRecordEqual);
+}
+
+/** The errors among `errors` that belong to any of `paths` or to fields under them. */
+export function errorsWithin(errors: Record<string, string>, paths: readonly string[]): Record<string, string> {
+  return Object.fromEntries(Object.entries(errors).filter(([p]) => p && paths.some((a) => isWithin(p, a))));
+}
+
+export const shallowRecordEqual = (a: Record<string, unknown>, b: Record<string, unknown>) => {
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => a[k] === b[k]);
+};
 
 export const shallowArrayEqual = (a?: readonly unknown[], b?: readonly unknown[]) =>
   a === b || (!!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]));
